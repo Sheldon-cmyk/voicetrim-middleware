@@ -148,31 +148,23 @@ def sum_food_log(phone, start_utc, end_utc):
     return int(cal), int(pro), int(carbs), int(fat), len(records)
 
 def handle_get_user_profile(phone, args):
-    """Check if user exists — returns natural language instruction for the AI to act on silently."""
+    """Returns the exact opening line the AI should say to the caller."""
     try:
         params = {"filterByFormula": f"{{Phone}}='{phone}'", "maxRecords": 1}
         records = airtable_get("Users", params)
         if not records:
-            return "NEW USER: Welcome them to VoiceTrim and collect their name, email, timezone, and optional calorie goal one at a time."
+            return "Hey, welcome to VoiceTrim! I'm your personal nutrition assistant. What's your name?"
         fields = records[0].get('fields', {})
         name  = fields.get('Name') or ''
         email = fields.get('Email') or ''
-        tz    = fields.get('Timezone') or ''
-        goal  = fields.get('Calorie Goal') or ''
         is_new = not name and not email
         if is_new:
-            return "NEW USER: Welcome them to VoiceTrim and collect their name, email, timezone, and optional calorie goal one at a time."
-        parts = []
-        if name:  parts.append(f"Name: {name}")
-        if email: parts.append(f"Email: {email}")
-        if tz:    parts.append(f"Timezone: {tz}")
-        if goal:  parts.append(f"Calorie goal: {int(float(goal))} calories/day")
-        profile_str = ", ".join(parts) if parts else "no profile details saved"
-        greeting_name = name.split()[0] if name else "there"
-        return f"RETURNING USER. {profile_str}. Greet them as 'Hey {greeting_name}, what are we logging today?' and go straight to helping them."
+            return "Hey, welcome to VoiceTrim! I'm your personal nutrition assistant. What's your name?"
+        first_name = name.split()[0] if name else 'there'
+        return f"Hey {first_name}, what are we logging today?"
     except Exception as e:
         app.logger.error(f"handle_get_user_profile error: {e}")
-        return "NEW USER: Welcome them to VoiceTrim and collect their name, email, timezone, and optional calorie goal one at a time."
+        return "Hey, welcome to VoiceTrim! What's your name?"
 
 def handle_log_food(phone, call_id, args):
     fields = {
@@ -236,7 +228,6 @@ def handle_delete_food(phone, args):
         actual_name = record.get('fields', {}).get('Food Name', food_name)
         del_resp = airtable_delete("Food Log", record_id)
         if del_resp.status_code == 200:
-            app.logger.info(f"delete_food: removed '{actual_name}' for {phone}")
             return f"Done, removed {actual_name} from your log."
         else:
             return f"Something went wrong removing {food_name}. Please try again."
@@ -392,7 +383,7 @@ def handle_send_summary_email(phone, args):
             name  = user_fields.get('Name', 'there')
             goal  = user_fields.get('Calorie Goal')
             if not email:
-                app.logger.warning(f'No email for {phone} — cannot send summary')
+                app.logger.warning(f'No email for {phone}')
                 return
 
             start_utc, end_utc = get_local_date_range(phone, 'week')
@@ -415,7 +406,7 @@ def handle_send_summary_email(phone, args):
 </div>
 <div style="background:#fff;padding:32px;border:1px solid #e0e0e0;border-top:none;">
   <h2 style="color:#1a1a1a;margin:0 0 8px;">Hey {first_name}!</h2>
-  <p style="color:#555;">Here is your nutrition recap for this week.</p>
+  <p style="color:#555;">Here's your nutrition recap for this week.</p>
   {goal_line}
   <table style="width:100%;border-collapse:collapse;margin:20px 0;">
     <tr style="background:#f8f9fa;">
