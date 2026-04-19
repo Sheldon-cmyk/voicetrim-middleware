@@ -3,7 +3,7 @@ import requests
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 app = Flask(__name__ )
 logging.basicConfig(level=logging.INFO)
@@ -35,7 +35,7 @@ def extract_call_info(body):
 
 def airtable_get(table, params):
     url = f"https://api.airtable.com/v0/{AIRTABLE_BASE}/{requests.utils.quote(table )}"
-    resp = requests.get(url, headers=AIRTABLE_HEADERS, params=params, timeout=10)
+    resp = requests.get(url, headers=AIRTABLE_HEADERS, params=params, timeout=15)
     return resp.json().get('records', [])
 
 def airtable_post(table, fields):
@@ -48,11 +48,40 @@ def airtable_patch(table, record_id, fields):
     resp = requests.patch(url, headers=AIRTABLE_HEADERS, json={"fields": fields}, timeout=10)
     return resp
 
-def today_utc():
-    return datetime.now(timezone.utc).strftime('%Y-%m-%d')
-
 def now_utc():
     return datetime.now(timezone.utc).isoformat()
+
+def get_date_range(period):
+    now = datetime.now(timezone.utc)
+    today = now.date()
+    if period == 'week':
+        start = today - timedelta(days=today.weekday())
+        return str(start), str(today)
+    elif period == 'month':
+        start = today.replace(day=1)
+        return str(start), str(today)
+    elif period == 'year':
+        start = today.replace(month=1, day=1)
+        return str(start), str(today)
+    else:
+        return str(today), str(today)
+
+def sum_food_log(phone, start_date, end_date):
+    formula = (
+        f"AND({{Phone}}='{phone}', "
+        f"{{Logged At}} >= '{start_date}', "
+        f"{{Logged At}} <= '{end_date}T23:59:59.000Z')"
+    )
+    params = {
+        "filterByFormula": formula,
+        "fields[]": ["Calories", "Protein", "Carbs", "Fat"],
+    }
+    records = airtable_get("Food Log", params)
+    cal   = sum(float(r.get('fields', {}).get('Calories', 0) or 0) for r in records)
+    pro   = sum(float(r.get('fields', {}).get('Protein',  0) or 0) for r in records)
+    carbs = sum(float(r.get('fields', {}).get('Carbs',    0) or 0) for r in records)
+    fat   = sum(float(r.get('fields', {}).get('Fat',      0) or 0) for r in records)
+    return int(cal), int(pro), int(carbs), int(fat), len(records)
 
 def handle_log_food(phone, call_id, args):
     fields = {
@@ -74,62 +103,30 @@ def handle_log_food(phone, call_id, args):
     if call_id:
         fields["Call ID"] = call_id
     resp = airtable_post("Food Log", fields)
-    success = resp.status_code in (200, 201)
     app.logger.info(f"log_food: {resp.status_code} - {fields.get('Food Name')} {fields.get('Calories')} cal")
-    if success:
-        _update_daily_log(phone, args)
     food = args.get('food_name', 'item')
     cal = args.get('calories', '')
     return f"Logged {food}" + (f" at {cal} calories" if cal else "")
 
-def _update_daily_log(phone, args):
-    today = today_utc()
-    params = {
-        "filterByFormula": f"AND({{Phone}}='{phone}', DATETIME_FORMAT({{Date}}, 'YYYY-MM-DD')='{today}')",
-        "maxRecords": 1
-    }
-    try:
-        calories = float(args.get('calories', 0) or 0)
-        protein  = float(args.get('protein',  0) or 0)
-        carbs    = float(args.get('carbs',    0) or 0)
-        fat      = float(args.get('fat',      0) or 0)
-        existing = airtable_get("Daily Logs", params)
-        if existing:
-            record_id = existing[0]['id']
-            cur = existing[0].get('fields', {})
-            update_fields = {
-                "Total Calories": float(cur.get('Total Calories', 0) or 0) + calories,
-                "Total Protein":  float(cur.get('Total Protein',  0) or 0) + protein,
-                "Total Carbs":    float(cur.get('Total Carbs',    0) or 0) + carbs,
-                "Total Fat":      float(cur.get('Total Fat',      0) or 0) + fat,
-            }
-            airtable_patch("Daily Logs", record_id, update_fields)
-        else:
-            airtable_post("Daily Logs", {
-                "Phone": phone, "Date": today,
-                "Total Calories": calories, "Total Protein": protein,
-                "Total Carbs": carbs, "Total Fat": fat,
-            })
-    except Exception as e:
-        app.logger.error(f"_update_daily_log error: {e}")
-
 def handle_get_totals(phone, args):
-    today = today_utc()
-    params = {
-        "filterByFormula": f"AND({{Phone}}='{phone}', DATETIME_FORMAT({{Date}}, 'YYYY-MM-DD')='{today}')",
-        "maxRecords": 1
-    }
+    period = str(args.get('period', 'today')).lower().strip()
+    if period in ('week', 'this week', 'weekly'):
+        period = 'week'
+    elif period in ('month', 'this month', 'monthly'):
+        period = 'month'
+    elif period in ('year', 'this year', 'yearly', 'annual'):
+        period = 'year'
+    else:
+        period = 'today'
+    start, end = get_date_range(period)
     try:
-        records = airtable_get("Daily Logs", params)
-        if records:
-            f = records[0].get('fields', {})
-            cal   = int(float(f.get('Total Calories', 0) or 0))
-            pro   = int(float(f.get('Total Protein',  0) or 0))
-            carbs = int(float(f.get('Total Carbs',    0) or 0))
-            fat   = int(float(f.get('Total Fat',      0) or 0))
-            return f"Today so far: {cal} calories, {pro}g protein, {carbs}g carbs, {fat}g fat."
-        else:
-            return "No food logged yet today."
+        cal, pro, carbs, fat, count = sum_food_log(phone, start, end)
+        if count == 0:
+            labels = {'today': 'today', 'week': 'this week', 'month': 'this month', 'year': 'this year'}
+            return f"No food logged {labels.get(period, 'today')} yet."
+        labels = {'today': 'Today', 'week': 'This week', 'month': 'This month', 'year': 'This year'}
+        label = labels.get(period, 'Today')
+        return f"{label}: {cal} calories, {pro}g protein, {carbs}g carbs, {fat}g fat."
     except Exception as e:
         app.logger.error(f"handle_get_totals error: {e}")
         return "I couldn't retrieve your totals right now. Please try again."
