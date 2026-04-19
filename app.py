@@ -131,8 +131,10 @@ def get_local_date_range(phone, period):
     else:
         start_local = today_local
         end_local = today_local
-    start_utc = datetime(start_local.year, start_local.month, start_local.day, 0, 0, 0, tzinfo=timezone.utc) - offset
-    end_utc = datetime(end_local.year, end_local.month, end_local.day, 23, 59, 59, tzinfo=timezone.utc) - offset
+    start_utc = datetime(start_local.year, start_local.month, start_local.day,
+                         0, 0, 0, tzinfo=timezone.utc) - offset
+    end_utc = datetime(end_local.year, end_local.month, end_local.day,
+                       23, 59, 59, tzinfo=timezone.utc) - offset
     return start_utc.strftime('%Y-%m-%dT%H:%M:%S.000Z'), end_utc.strftime('%Y-%m-%dT%H:%M:%S.000Z')
 
 def sum_food_log(phone, start_utc, end_utc):
@@ -146,8 +148,13 @@ def sum_food_log(phone, start_utc, end_utc):
     return int(cal), int(pro), int(carbs), int(fat), len(records)
 
 def handle_log_food(phone, call_id, args):
-    fields = {"Phone": phone, "Food Name": str(args.get('food_name', '')), "Logged At": now_utc()}
-    for field, key in [("Calories", "calories"), ("Protein", "protein"), ("Carbs", "carbs"), ("Fat", "fat")]:
+    fields = {
+        "Phone": phone,
+        "Food Name": str(args.get('food_name', '')),
+        "Logged At": now_utc(),
+    }
+    for field, key in [("Calories", "calories"), ("Protein", "protein"),
+                        ("Carbs", "carbs"), ("Fat", "fat")]:
         val = args.get(key)
         if val is not None:
             try:
@@ -167,22 +174,40 @@ def handle_delete_food(phone, args):
     if not food_name:
         return "Which item would you like me to remove?"
     start_utc, end_utc = get_local_date_range(phone, 'today')
-    formula = (f"AND({{Phone}}='{phone}', {{Logged At}} >= '{start_utc}', {{Logged At}} <= '{end_utc}', "
-               f"FIND(LOWER('{food_name.lower()}'), LOWER({{Food Name}})) > 0)")
-    params = {"filterByFormula": formula, "sort[0][field]": "Logged At", "sort[0][direction]": "desc", "maxRecords": 1}
+    formula = (
+        f"AND({{Phone}}='{phone}', "
+        f"{{Logged At}} >= '{start_utc}', "
+        f"{{Logged At}} <= '{end_utc}', "
+        f"FIND(LOWER('{food_name.lower()}'), LOWER({{Food Name}})) > 0)"
+    )
+    params = {
+        "filterByFormula": formula,
+        "sort[0][field]": "Logged At",
+        "sort[0][direction]": "desc",
+        "maxRecords": 1
+    }
     try:
         records = airtable_get("Food Log", params)
         if not records:
             start_utc2, end_utc2 = get_local_date_range(phone, 'week')
-            formula2 = (f"AND({{Phone}}='{phone}', {{Logged At}} >= '{start_utc2}', "
-                        f"FIND(LOWER('{food_name.lower()}'), LOWER({{Food Name}})) > 0)")
-            params2 = {"filterByFormula": formula2, "sort[0][field]": "Logged At", "sort[0][direction]": "desc", "maxRecords": 1}
+            formula2 = (
+                f"AND({{Phone}}='{phone}', "
+                f"{{Logged At}} >= '{start_utc2}', "
+                f"FIND(LOWER('{food_name.lower()}'), LOWER({{Food Name}})) > 0)"
+            )
+            params2 = {
+                "filterByFormula": formula2,
+                "sort[0][field]": "Logged At",
+                "sort[0][direction]": "desc",
+                "maxRecords": 1
+            }
             records = airtable_get("Food Log", params2)
         if not records:
             return f"I don't see {food_name} in your recent logs. Nothing was removed."
         record = records[0]
+        record_id = record['id']
         actual_name = record.get('fields', {}).get('Food Name', food_name)
-        del_resp = airtable_delete("Food Log", record['id'])
+        del_resp = airtable_delete("Food Log", record_id)
         if del_resp.status_code == 200:
             app.logger.info(f"delete_food: removed '{actual_name}' for {phone}")
             return f"Done, removed {actual_name} from your log."
@@ -208,21 +233,21 @@ def handle_get_totals(phone, args):
         if count == 0:
             labels = {'today': 'today', 'week': 'this week', 'month': 'this month', 'year': 'this year'}
             return f"Nothing logged {labels.get(period, 'today')} yet."
-        labels = {'today': 'Today', 'week': 'This week', 'month': 'This month', 'year': 'This year'}
-        label = labels.get(period, 'Today')
+        label = {'today': 'Today', 'week': 'This week', 'month': 'This month', 'year': 'This year'}.get(period, 'Today')
         goal_text = ""
         try:
             params = {"filterByFormula": f"{{Phone}}='{phone}'", "fields[]": ["Calorie Goal"], "maxRecords": 1}
             user_records = airtable_get("Users", params)
-            if user_records and period == 'today':
+            if user_records:
                 goal = user_records[0].get('fields', {}).get('Calorie Goal')
-                if goal:
+                if goal and period == 'today':
                     goal = int(goal)
                     remaining = goal - cal
                     if remaining > 0:
-                        goal_text = f" {remaining} calories left of your {goal} goal."
+                        goal_text = f" You have {remaining} calories left of your {goal} goal."
                     else:
-                        goal_text = f" {abs(remaining)} calories over your {goal} goal."
+                        over = abs(remaining)
+                        goal_text = f" You're {over} calories over your {goal} goal."
         except Exception:
             pass
         return f"{label}: {cal} calories, {pro}g protein, {carbs}g carbs, {fat}g fat.{goal_text}"
@@ -254,9 +279,9 @@ def handle_save_profile(phone, args):
         if args.get('timezone'):
             parts.append(f"timezone set to {args['timezone']}")
         if args.get('name'):
-            parts.append("name saved")
+            parts.append(f"name saved")
         if args.get('email'):
-            parts.append("email saved")
+            parts.append(f"email saved")
         if args.get('calorie_goal'):
             parts.append(f"calorie goal set to {args['calorie_goal']}")
         return "Got it, " + ", ".join(parts) + "." if parts else "Profile saved."
@@ -291,14 +316,14 @@ def handle_log_usual(phone, call_id, args):
         for food in [x.strip() for x in foods_str.split(',') if x.strip()]:
             handle_log_food(phone, call_id, {'food_name': food})
             logged.append(food)
-        return f"Logged your usual {meal_name}."
+        return f"Logged your usual {meal_name} — {', '.join(logged)}."
     except Exception as e:
         app.logger.error(f"handle_log_usual error: {e}")
         return "Logged."
 
 def handle_log_shopping_item(phone, args):
     item = args.get('item', '')
-    qty = args.get('quantity', '')
+    qty  = args.get('quantity', '')
     try:
         airtable_post("Shopping List", {"Phone": phone, "Item": str(item), "Quantity": str(qty), "Added At": now_utc()})
         return f"Added {item} to your shopping list."
@@ -307,18 +332,94 @@ def handle_log_shopping_item(phone, args):
         return "Added."
 
 def handle_save_meal_plan(phone, args):
-    day = args.get('day', '')
-    meal = args.get('meal', '')
+    day   = args.get('day', '')
+    meal  = args.get('meal', '')
     foods = args.get('foods', '')
     try:
         airtable_post("Meal Plans", {"Phone": phone, "Day": str(day), "Meal": str(meal), "Foods": str(foods), "Saved At": now_utc()})
-        return f"Saved {meal} for {day}."
+        return f"Saved {meal} for {day} — {foods}."
     except Exception as e:
         app.logger.error(f"handle_save_meal_plan error: {e}")
         return "Saved."
 
 def handle_send_summary_email(phone, args):
-    app.logger.info(f"send_summary_email requested for {phone}")
+    import threading
+
+    def send_async():
+        try:
+            from sendgrid import SendGridAPIClient
+            from sendgrid.helpers.mail import Mail
+
+            SENDGRID_KEY = os.environ.get('SENDGRID_API_KEY', '')
+            FROM_EMAIL   = os.environ.get('FROM_EMAIL', 'Sheldon@matcedi.com')
+            if not SENDGRID_KEY:
+                app.logger.error('SENDGRID_API_KEY not set')
+                return
+
+            params = {'filterByFormula': f"{{Phone}}='{phone}'", 'maxRecords': 1}
+            records = airtable_get('Users', params)
+            if not records:
+                return
+            user_fields = records[0].get('fields', {})
+            email = user_fields.get('Email', '')
+            name  = user_fields.get('Name', 'there')
+            goal  = user_fields.get('Calorie Goal')
+            if not email:
+                return
+
+            start_utc, end_utc = get_local_date_range(phone, 'week')
+            cal, pro, carbs, fat, count = sum_food_log(phone, start_utc, end_utc)
+
+            first_name = name.split()[0] if name and name != 'there' else 'there'
+            goal_line = ''
+            if goal and count > 0:
+                avg = cal / max(count, 1)
+                if avg <= float(goal):
+                    goal_line = f'<p style="color:#2e7d32;">On track — averaging {int(avg)} cal/day vs your {int(float(goal))} goal.</p>'
+                else:
+                    goal_line = f'<p style="color:#e65100;">Slightly over — averaging {int(avg)} cal/day vs your {int(float(goal))} goal.</p>'
+
+            html = f"""<!DOCTYPE html>
+<html><body style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;">
+<div style="background:#1a1a2e;padding:24px;border-radius:8px 8px 0 0;text-align:center;">
+  <h1 style="color:#fff;margin:0;font-size:24px;">VoiceTrim</h1>
+  <p style="color:#a0aec0;margin:4px 0 0;font-size:13px;">Your Weekly Nutrition Summary</p>
+</div>
+<div style="background:#fff;padding:32px;border:1px solid #e0e0e0;border-top:none;">
+  <h2 style="color:#1a1a1a;margin:0 0 8px;">Hey {first_name}!</h2>
+  <p style="color:#555;">Here is your nutrition recap for this week.</p>
+  {goal_line}
+  <table style="width:100%;border-collapse:collapse;margin:20px 0;">
+    <tr style="background:#f8f9fa;">
+      <td style="padding:16px;text-align:center;border-radius:6px;"><div style="font-size:28px;font-weight:700;color:#1a1a1a;">{cal:,}</div><div style="font-size:11px;color:#888;text-transform:uppercase;margin-top:4px;">Calories</div></td>
+      <td style="width:8px;"></td>
+      <td style="padding:16px;text-align:center;background:#f8f9fa;border-radius:6px;"><div style="font-size:28px;font-weight:700;color:#4caf50;">{pro}g</div><div style="font-size:11px;color:#888;text-transform:uppercase;margin-top:4px;">Protein</div></td>
+      <td style="width:8px;"></td>
+      <td style="padding:16px;text-align:center;background:#f8f9fa;border-radius:6px;"><div style="font-size:28px;font-weight:700;color:#2196f3;">{carbs}g</div><div style="font-size:11px;color:#888;text-transform:uppercase;margin-top:4px;">Carbs</div></td>
+      <td style="width:8px;"></td>
+      <td style="padding:16px;text-align:center;background:#f8f9fa;border-radius:6px;"><div style="font-size:28px;font-weight:700;color:#ff9800;">{fat}g</div><div style="font-size:11px;color:#888;text-transform:uppercase;margin-top:4px;">Fat</div></td>
+    </tr>
+  </table>
+  <div style="text-align:center;margin-top:24px;">
+    <a href="tel:+19714321012" style="background:#1a1a2e;color:#fff;padding:12px 28px;border-radius:6px;text-decoration:none;font-weight:600;">Call VoiceTrim</a>
+    <p style="color:#aaa;font-size:12px;margin-top:8px;">+1 (971) 432-1012</p>
+  </div>
+</div>
+</body></html>"""
+
+            message = Mail(
+                from_email=(FROM_EMAIL, 'VoiceTrim'),
+                to_emails=email,
+                subject='Your VoiceTrim Weekly Summary',
+                html_content=html
+            )
+            sg = SendGridAPIClient(SENDGRID_KEY)
+            sg.send(message)
+            app.logger.info(f'Weekly summary sent to {email}')
+        except Exception as e:
+            app.logger.error(f'send_summary_email error: {e}', exc_info=True)
+
+    threading.Thread(target=send_async, daemon=True).start()
     return "I'll send your nutrition summary to your email shortly."
 
 TOOL_HANDLERS = {
