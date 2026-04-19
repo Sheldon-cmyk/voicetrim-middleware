@@ -1,7 +1,3 @@
-"""
-VoiceTrim Middleware Server
-Receives Vapi tool calls and writes directly to Airtable.
-"""
 from flask import Flask, request, jsonify
 import requests
 import json
@@ -12,8 +8,8 @@ from datetime import datetime, timezone
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-AIRTABLE_TOKEN = os.environ.get("AIRTABLE_TOKEN", "REDACTED_TOKEN")
-AIRTABLE_BASE = os.environ.get("AIRTABLE_BASE", "appJbb8o6E2TmCHNR")
+AIRTABLE_TOKEN = os.environ["AIRTABLE_TOKEN"]
+AIRTABLE_BASE = os.environ["AIRTABLE_BASE"]
 
 AIRTABLE_HEADERS = {
     "Authorization": f"Bearer {AIRTABLE_TOKEN}",
@@ -21,12 +17,11 @@ AIRTABLE_HEADERS = {
 }
 
 MAKE_WEBHOOKS = {
-    "get_totals":         "https://hook.us2.make.com/q1hare1nb12u8lblgxrpp2pzv8di87fz",
-    "save_usual":         "https://hook.us2.make.com/u1d41yyzb3uacyn3ye3o9sn3k0bzaxp2",
-    "log_usual":          "https://hook.us2.make.com/ra7zfl46u51x22ju1djxuixl7orrzwv1",
-    "log_shopping_item":  "https://hook.us2.make.com/p5j4ulkoqhp3lgd6elywg63x24tmkptr",
-    "save_meal_plan":     "https://hook.us2.make.com/vxlfupd3uq5ddupdxqqj0bx53owzm4px",
-    "send_summary_email": "https://hook.us2.make.com/xjctrvmkg359ljkrgvc4bu3hl781vvco",
+    "save_usual": os.environ.get("MAKE_SAVE_USUAL", ""),
+    "log_usual": os.environ.get("MAKE_LOG_USUAL", ""),
+    "log_shopping_item": os.environ.get("MAKE_LOG_SHOPPING", ""),
+    "save_meal_plan": os.environ.get("MAKE_SAVE_MEAL_PLAN", ""),
+    "send_summary_email": os.environ.get("MAKE_SEND_EMAIL", ""),
 }
 
 def parse_args(func):
@@ -71,6 +66,29 @@ def log_food_to_airtable(phone, call_id, args):
     resp = requests.post(url, headers=AIRTABLE_HEADERS, json={"fields": fields}, timeout=10)
     app.logger.info(f"Food Log: {resp.status_code} - {fields.get('Food Name')} {fields.get('Calories')} cal")
     return resp.status_code in (200, 201)
+
+def get_daily_totals(phone):
+    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    search_url = f"https://api.airtable.com/v0/{AIRTABLE_BASE}/Daily%20Logs"
+    params = {
+        "filterByFormula": f"AND({{Phone}}='{phone}', DATETIME_FORMAT({{Date}}, 'YYYY-MM-DD')='{today}')",
+        "maxRecords": 1
+    }
+    try:
+        resp = requests.get(search_url, headers=AIRTABLE_HEADERS, params=params, timeout=10)
+        records = resp.json().get('records', [])
+        if records:
+            f = records[0].get('fields', {})
+            cal = int(float(f.get('Total Calories', 0) or 0))
+            pro = int(float(f.get('Total Protein', 0) or 0))
+            carbs = int(float(f.get('Total Carbs', 0) or 0))
+            fat = int(float(f.get('Total Fat', 0) or 0))
+            return f"Today so far: {cal} calories, {pro}g protein, {carbs}g carbs, {fat}g fat."
+        else:
+            return "No food logged yet today."
+    except Exception as e:
+        app.logger.error(f"get_totals error: {e}")
+        return "I couldn't retrieve your totals right now. Please try again."
 
 def update_daily_log(phone, args):
     today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
@@ -133,13 +151,18 @@ def handle_tool(tool_name):
                 food = args.get('food_name', 'item')
                 cal = args.get('calories', '')
                 result_text = f"Logged {food}" + (f" at {cal} calories" if cal else "")
+
+            elif name == 'get_totals':
+                result_text = get_daily_totals(phone)
+                app.logger.info(f"get_totals result: {result_text}")
+
             else:
                 make_url = MAKE_WEBHOOKS.get(name)
                 if make_url:
                     payload = {"phone": phone, "call_id": call_id, "tool_name": name, **args}
                     try:
                         resp = requests.post(make_url, json=payload, timeout=10)
-                        result_text = resp.text[:200] if resp.text and name == 'get_totals' else "done"
+                        result_text = "done"
                     except:
                         result_text = "done"
                 else:
