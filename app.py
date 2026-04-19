@@ -147,25 +147,6 @@ def sum_food_log(phone, start_utc, end_utc):
     fat   = sum(float(r.get('fields', {}).get('Fat',      0) or 0) for r in records)
     return int(cal), int(pro), int(carbs), int(fat), len(records)
 
-def handle_get_user_profile(phone, args):
-    """Returns the exact opening line the AI should say to the caller."""
-    try:
-        params = {"filterByFormula": f"{{Phone}}='{phone}'", "maxRecords": 1}
-        records = airtable_get("Users", params)
-        if not records:
-            return "Hey, welcome to VoiceTrim! I'm your personal nutrition assistant. What's your name?"
-        fields = records[0].get('fields', {})
-        name  = fields.get('Name') or ''
-        email = fields.get('Email') or ''
-        is_new = not name and not email
-        if is_new:
-            return "Hey, welcome to VoiceTrim! I'm your personal nutrition assistant. What's your name?"
-        first_name = name.split()[0] if name else 'there'
-        return f"Hey {first_name}, what are we logging today?"
-    except Exception as e:
-        app.logger.error(f"handle_get_user_profile error: {e}")
-        return "Hey, welcome to VoiceTrim! What's your name?"
-
 def handle_log_food(phone, call_id, args):
     fields = {
         "Phone": phone,
@@ -228,6 +209,7 @@ def handle_delete_food(phone, args):
         actual_name = record.get('fields', {}).get('Food Name', food_name)
         del_resp = airtable_delete("Food Log", record_id)
         if del_resp.status_code == 200:
+            app.logger.info(f"delete_food: removed '{actual_name}' for {phone}")
             return f"Done, removed {actual_name} from your log."
         else:
             return f"Something went wrong removing {food_name}. Please try again."
@@ -251,7 +233,8 @@ def handle_get_totals(phone, args):
         if count == 0:
             labels = {'today': 'today', 'week': 'this week', 'month': 'this month', 'year': 'this year'}
             return f"Nothing logged {labels.get(period, 'today')} yet."
-        label = {'today': 'Today', 'week': 'This week', 'month': 'This month', 'year': 'This year'}.get(period, 'Today')
+        labels = {'today': 'Today', 'week': 'This week', 'month': 'This month', 'year': 'This year'}
+        label = labels.get(period, 'Today')
         goal_text = ""
         try:
             params = {"filterByFormula": f"{{Phone}}='{phone}'", "fields[]": ["Calorie Goal"], "maxRecords": 1}
@@ -377,6 +360,7 @@ def handle_send_summary_email(phone, args):
             params = {'filterByFormula': f"{{Phone}}='{phone}'", 'maxRecords': 1}
             records = airtable_get('Users', params)
             if not records:
+                app.logger.warning(f'No user record for {phone}')
                 return
             user_fields = records[0].get('fields', {})
             email = user_fields.get('Email', '')
@@ -441,6 +425,24 @@ def handle_send_summary_email(phone, args):
     threading.Thread(target=send_async, daemon=True).start()
     return "I'll send your nutrition summary to your email shortly."
 
+def handle_get_user_profile(phone, args):
+    try:
+        params = {"filterByFormula": f"{{Phone}}='{phone}'", "maxRecords": 1}
+        records = airtable_get("Users", params)
+        if not records:
+            return "Hey, welcome to VoiceTrim! I'm your personal nutrition assistant. What's your name?"
+        fields = records[0].get('fields', {})
+        name  = fields.get('Name') or ''
+        email = fields.get('Email') or ''
+        is_new = not name and not email
+        if is_new:
+            return "Hey, welcome to VoiceTrim! I'm your personal nutrition assistant. What's your name?"
+        first_name = name.split()[0] if name else 'there'
+        return f"Hey {first_name}, what are we logging today?"
+    except Exception as e:
+        app.logger.error(f"handle_get_user_profile error: {e}")
+        return "Hey, welcome to VoiceTrim! What's your name?"
+
 TOOL_HANDLERS = {
     'log_food':           lambda phone, call_id, args: handle_log_food(phone, call_id, args),
     'delete_food':        lambda phone, call_id, args: handle_delete_food(phone, args),
@@ -481,6 +483,47 @@ def handle_tool(tool_name):
     except Exception as e:
         app.logger.error(f"Route error: {e}", exc_info=True)
         return jsonify({"results": [{"toolCallId": "error", "result": "logged"}]}), 200
+
+@app.route('/call-start', methods=['POST'])
+def call_start():
+    try:
+        body = request.json or {}
+        call = body.get('message', {}).get('call', body.get('call', {}))
+        phone = call.get('customer', {}).get('number', '')
+        app.logger.info(f"call-start: phone={phone}")
+
+        first_name = 'there'
+        is_new = True
+        if phone:
+            try:
+                params = {"filterByFormula": f"{{Phone}}='{phone}'", "maxRecords": 1}
+                records = airtable_get("Users", params)
+                if records:
+                    fields = records[0].get('fields', {})
+                    name = fields.get('Name', '')
+                    email = fields.get('Email', '')
+                    if name or email:
+                        is_new = False
+                        first_name = name.split()[0] if name else 'there'
+            except Exception as e:
+                app.logger.warning(f"call-start lookup error: {e}")
+
+        if is_new:
+            greeting = "Hey there, welcome to VoiceTrim! I'm your personal nutrition assistant. What's your name?"
+        else:
+            greeting = f"Hey {first_name}, what are we logging today?"
+
+        app.logger.info(f"call-start: greeting='{greeting}'")
+        return jsonify({
+            "variableValues": {
+                "greeting": greeting,
+                "first_name": first_name,
+                "is_new_user": str(is_new).lower()
+            }
+        })
+    except Exception as e:
+        app.logger.error(f"call-start error: {e}", exc_info=True)
+        return jsonify({"variableValues": {"greeting": "Hey there, what are we logging today?", "first_name": "there", "is_new_user": "false"}})
 
 @app.route('/health', methods=['GET'])
 def health():
