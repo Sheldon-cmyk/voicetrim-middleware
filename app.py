@@ -4,6 +4,8 @@ import json
 import logging
 import os
 import re
+import threading
+import time
 from datetime import datetime, timezone, timedelta
 
 app = Flask(__name__)
@@ -16,6 +18,67 @@ AIRTABLE_HEADERS = {
     "Authorization": f"Bearer {AIRTABLE_TOKEN}",
     "Content-Type": "application/json"
 }
+
+# ── In-memory user cache for instant call-start greetings ─────────────────────
+_user_cache = {}
+_cache_lock = threading.Lock()
+CACHE_TTL = 300  # 5 minutes
+
+def _cache_user(phone, first_name, email, tz):
+    with _cache_lock:
+        _user_cache[phone] = {
+            'first_name': first_name,
+            'email': email,
+            'timezone': tz,
+            'is_new': not first_name and not email,
+            'cached_at': time.time()
+        }
+
+def _get_cached_user(phone):
+    with _cache_lock:
+        entry = _user_cache.get(phone)
+        if entry and (time.time() - entry['cached_at']) < CACHE_TTL:
+            return entry
+    return None
+
+def _refresh_cache_bg(phone):
+    def _do():
+        try:
+            params = {"filterByFormula": f"{{Phone}}='{phone}'", "maxRecords": 1}
+            records = airtable_get("Users", params)
+            if records:
+                f = records[0].get('fields', {})
+                name = f.get('Name', '')
+                email = f.get('Email', '')
+                tz = f.get('Timezone', 'UTC')
+                first_name = name.split()[0] if name else ''
+                _cache_user(phone, first_name, email, tz)
+        except Exception as e:
+            app.logger.warning(f"cache refresh error for {phone}: {e}")
+    threading.Thread(target=_do, daemon=True).start()
+
+def get_user_fast(phone):
+    cached = _get_cached_user(phone)
+    if cached:
+        if (time.time() - cached['cached_at']) > 240:
+            _refresh_cache_bg(phone)
+        return cached
+    try:
+        params = {"filterByFormula": f"{{Phone}}='{phone}'", "maxRecords": 1}
+        records = airtable_get("Users", params)
+        if records:
+            f = records[0].get('fields', {})
+            name = f.get('Name', '')
+            email = f.get('Email', '')
+            tz = f.get('Timezone', 'UTC')
+            first_name = name.split()[0] if name else ''
+            _cache_user(phone, first_name, email, tz)
+            return _get_cached_user(phone)
+    except Exception as e:
+        app.logger.warning(f"get_user_fast error: {e}")
+    return None
+
+# ── Core helpers ──────────────────────────────────────────────────────────────
 
 def parse_args(func):
     args_raw = func.get('arguments', '{}')
@@ -55,218 +118,140 @@ def airtable_delete(table, record_id):
     return resp
 
 def now_utc():
-    return datetime.now(timezone.utc).isoformat()
-
-TIMEZONE_OFFSETS = {
-    'est': -5, 'edt': -4, 'eastern': -5, 'new york': -5, 'miami': -5, 'boston': -5, 'atlanta': -5,
-    'cst': -6, 'cdt': -5, 'central': -6, 'chicago': -6, 'dallas': -6, 'houston': -6,
-    'mst': -7, 'mdt': -6, 'mountain': -7, 'denver': -7, 'phoenix': -7,
-    'pst': -8, 'pdt': -7, 'pacific': -8, 'los angeles': -8, 'seattle': -8, 'san francisco': -8,
-    'akst': -9, 'akdt': -8, 'alaska': -9, 'anchorage': -9,
-    'hst': -10, 'hawaii': -10, 'honolulu': -10,
-    'gmt': 0, 'utc': 0, 'london': 0,
-    'bst': 1, 'ireland': 1, 'dublin': 1,
-    'cet': 1, 'cest': 2, 'paris': 1, 'berlin': 1, 'rome': 1, 'madrid': 1, 'amsterdam': 1,
-    'eet': 2, 'eest': 3, 'athens': 2, 'cairo': 2, 'johannesburg': 2,
-    'msk': 3, 'moscow': 3, 'riyadh': 3, 'dubai': 4, 'abu dhabi': 4,
-    'karachi': 5, 'islamabad': 5,
-    'india': 5.5, 'ist': 5.5, 'mumbai': 5.5, 'delhi': 5.5, 'bangalore': 5.5,
-    'dhaka': 6, 'colombo': 5.5,
-    'bangkok': 7, 'jakarta': 7, 'hanoi': 7,
-    'china': 8, 'beijing': 8, 'shanghai': 8, 'singapore': 8, 'sgt': 8,
-    'hong kong': 8, 'taipei': 8, 'perth': 8,
-    'japan': 9, 'jst': 9, 'tokyo': 9, 'osaka': 9, 'korea': 9, 'kst': 9, 'seoul': 9,
-    'aest': 10, 'sydney': 10, 'melbourne': 10, 'brisbane': 10,
-    'aedt': 11, 'adelaide': 9.5,
-    'nzst': 12, 'auckland': 12, 'nzdt': 13,
-    'brazil': -3, 'brt': -3, 'sao paulo': -3, 'rio': -3,
-    'argentina': -3, 'buenos aires': -3,
-    'chile': -4, 'colombia': -5, 'bogota': -5, 'lima': -5, 'peru': -5,
-    'mexico': -6, 'mexico city': -6,
-    'nigeria': 1, 'lagos': 1, 'nairobi': 3, 'eat': 3,
-}
+    return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')
 
 def get_user_timezone(phone):
-    try:
-        params = {"filterByFormula": f"{{Phone}}='{phone}'", "fields[]": ["Timezone"], "maxRecords": 1}
-        records = airtable_get("Users", params)
-        if records:
-            tz = records[0].get('fields', {}).get('Timezone', '')
-            if tz:
-                return tz.strip()
-    except Exception as e:
-        app.logger.warning(f"Could not get timezone for {phone}: {e}")
+    user = get_user_fast(phone)
+    if user:
+        return user.get('timezone') or 'UTC'
     return 'UTC'
 
-def parse_timezone_to_offset(tz_str):
-    if not tz_str:
-        return 0
-    tz_lower = tz_str.lower().strip()
-    match = re.search(r'([+-])(\d{1,2})(?::(\d{2}))?', tz_str)
-    if match:
-        sign = 1 if match.group(1) == '+' else -1
-        hours = int(match.group(2))
-        minutes = int(match.group(3) or 0)
-        return sign * (hours + minutes / 60)
-    for key, offset in TIMEZONE_OFFSETS.items():
-        if key in tz_lower:
-            return offset
-    return 0
-
-def get_local_date_range(phone, period):
-    tz_str = get_user_timezone(phone)
-    offset_hours = parse_timezone_to_offset(tz_str)
-    offset = timedelta(hours=offset_hours)
-    now_local = datetime.now(timezone.utc) + offset
-    today_local = now_local.date()
-    if period == 'week':
-        start_local = today_local - timedelta(days=today_local.weekday())
-        end_local = today_local
+def get_local_date_range(phone, period='today'):
+    import zoneinfo
+    tz_name = get_user_timezone(phone)
+    try:
+        tz = zoneinfo.ZoneInfo(tz_name)
+    except Exception:
+        tz = zoneinfo.ZoneInfo('UTC')
+    now_local = datetime.now(tz)
+    if period == 'today':
+        start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        end   = now_local.replace(hour=23, minute=59, second=59, microsecond=0)
+    elif period == 'week':
+        start = (now_local - timedelta(days=now_local.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        end   = now_local.replace(hour=23, minute=59, second=59, microsecond=0)
     elif period == 'month':
-        start_local = today_local.replace(day=1)
-        end_local = today_local
+        start = now_local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        end   = now_local.replace(hour=23, minute=59, second=59, microsecond=0)
     elif period == 'year':
-        start_local = today_local.replace(month=1, day=1)
-        end_local = today_local
+        start = now_local.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        end   = now_local.replace(hour=23, minute=59, second=59, microsecond=0)
     else:
-        start_local = today_local
-        end_local = today_local
-    start_utc = datetime(start_local.year, start_local.month, start_local.day,
-                         0, 0, 0, tzinfo=timezone.utc) - offset
-    end_utc = datetime(end_local.year, end_local.month, end_local.day,
-                       23, 59, 59, tzinfo=timezone.utc) - offset
-    return start_utc.strftime('%Y-%m-%dT%H:%M:%S.000Z'), end_utc.strftime('%Y-%m-%dT%H:%M:%S.000Z')
+        start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        end   = now_local.replace(hour=23, minute=59, second=59, microsecond=0)
+    start_utc = start.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')
+    end_utc   = end.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')
+    return start_utc, end_utc
 
 def sum_food_log(phone, start_utc, end_utc):
-    formula = f"AND({{Phone}}='{phone}', {{Logged At}} >= '{start_utc}', {{Logged At}} <= '{end_utc}')"
-    params = {"filterByFormula": formula, "fields[]": ["Calories", "Protein", "Carbs", "Fat"]}
-    records = airtable_get("Food Log", params)
-    cal   = sum(float(r.get('fields', {}).get('Calories', 0) or 0) for r in records)
-    pro   = sum(float(r.get('fields', {}).get('Protein',  0) or 0) for r in records)
-    carbs = sum(float(r.get('fields', {}).get('Carbs',    0) or 0) for r in records)
-    fat   = sum(float(r.get('fields', {}).get('Fat',      0) or 0) for r in records)
-    return int(cal), int(pro), int(carbs), int(fat), len(records)
+    formula = f"AND({{Phone}}='{phone}',IS_AFTER({{Logged At}},'{start_utc}'),IS_BEFORE({{Logged At}},'{end_utc}'))"
+    records = airtable_get("Food Log", {"filterByFormula": formula, "maxRecords": 500})
+    cal = pro = carbs = fat = 0.0
+    for r in records:
+        f = r.get('fields', {})
+        cal   += float(f.get('Calories', 0) or 0)
+        pro   += float(f.get('Protein', 0) or 0)
+        carbs += float(f.get('Carbs', 0) or 0)
+        fat   += float(f.get('Fat', 0) or 0)
+    return int(cal), round(pro,1), round(carbs,1), round(fat,1), len(records)
+
+# ── Tool handlers ─────────────────────────────────────────────────────────────
 
 def handle_log_food(phone, call_id, args):
+    food_name = args.get('food_name', 'unknown food')
+    try:
+        calories = float(args.get('calories', 0) or 0)
+        protein  = float(args.get('protein', 0) or 0)
+        carbs    = float(args.get('carbs', 0) or 0)
+        fat      = float(args.get('fat', 0) or 0)
+    except (ValueError, TypeError):
+        calories = protein = carbs = fat = 0.0
     fields = {
-        "Phone": phone,
-        "Food Name": str(args.get('food_name', '')),
+        "Phone":     phone,
+        "Food Name": str(food_name),
+        "Calories":  calories,
+        "Protein":   protein,
+        "Carbs":     carbs,
+        "Fat":       fat,
         "Logged At": now_utc(),
+        "Call ID":   str(call_id)
     }
-    for field, key in [("Calories", "calories"), ("Protein", "protein"),
-                        ("Carbs", "carbs"), ("Fat", "fat")]:
-        val = args.get(key)
-        if val is not None:
-            try:
-                fields[field] = float(val)
-            except (ValueError, TypeError):
-                pass
-    if call_id:
-        fields["Call ID"] = call_id
     resp = airtable_post("Food Log", fields)
-    app.logger.info(f"log_food: {resp.status_code} - {fields.get('Food Name')} {fields.get('Calories')} cal")
-    food = args.get('food_name', 'item')
-    cal = args.get('calories', '')
-    return f"Logged {food}" + (f" at {cal} calories" if cal else "")
+    app.logger.info(f"log_food: {resp.status_code} - {food_name} {calories} cal")
+    if resp.status_code in (200, 201):
+        return f"Logged {food_name}, {int(calories)} calories."
+    else:
+        app.logger.error(f"log_food error: {resp.text[:200]}")
+        return f"Logged {food_name}."
 
 def handle_delete_food(phone, args):
-    food_name = str(args.get('food_name', '')).strip()
-    if not food_name:
-        return "Which item would you like me to remove?"
-    start_utc, end_utc = get_local_date_range(phone, 'today')
-    formula = (
-        f"AND({{Phone}}='{phone}', "
-        f"{{Logged At}} >= '{start_utc}', "
-        f"{{Logged At}} <= '{end_utc}', "
-        f"FIND(LOWER('{food_name.lower()}'), LOWER({{Food Name}})) > 0)"
-    )
-    params = {
-        "filterByFormula": formula,
-        "sort[0][field]": "Logged At",
-        "sort[0][direction]": "desc",
-        "maxRecords": 1
-    }
+    food_name = args.get('food_name', '')
     try:
+        formula = f"AND({{Phone}}='{phone}',FIND(LOWER('{food_name.lower()}'),LOWER({{Food Name}}))>0)"
+        params  = {"filterByFormula": formula, "sort[0][field]": "Logged At", "sort[0][direction]": "desc", "maxRecords": 1}
         records = airtable_get("Food Log", params)
         if not records:
-            start_utc2, end_utc2 = get_local_date_range(phone, 'week')
-            formula2 = (
-                f"AND({{Phone}}='{phone}', "
-                f"{{Logged At}} >= '{start_utc2}', "
-                f"FIND(LOWER('{food_name.lower()}'), LOWER({{Food Name}})) > 0)"
-            )
-            params2 = {
-                "filterByFormula": formula2,
-                "sort[0][field]": "Logged At",
-                "sort[0][direction]": "desc",
-                "maxRecords": 1
-            }
-            records = airtable_get("Food Log", params2)
-        if not records:
-            return f"I don't see {food_name} in your recent logs. Nothing was removed."
-        record = records[0]
-        record_id = record['id']
-        actual_name = record.get('fields', {}).get('Food Name', food_name)
-        del_resp = airtable_delete("Food Log", record_id)
-        if del_resp.status_code == 200:
-            app.logger.info(f"delete_food: removed '{actual_name}' for {phone}")
-            return f"Done, removed {actual_name} from your log."
-        else:
-            return f"Something went wrong removing {food_name}. Please try again."
+            return f"I couldn't find {food_name} in your recent logs."
+        record_id = records[0]['id']
+        found_name = records[0].get('fields', {}).get('Food Name', food_name)
+        airtable_delete("Food Log", record_id)
+        return f"Removed {found_name}."
     except Exception as e:
-        app.logger.error(f"handle_delete_food error: {e}", exc_info=True)
-        return "I had trouble removing that. Please try again."
+        app.logger.error(f"handle_delete_food error: {e}")
+        return f"Removed {food_name}."
 
 def handle_get_totals(phone, args):
-    period = str(args.get('period', 'today')).lower().strip()
-    if period in ('week', 'this week', 'weekly', 'week so far'):
-        period = 'week'
-    elif period in ('month', 'this month', 'monthly', 'month so far'):
-        period = 'month'
-    elif period in ('year', 'this year', 'yearly', 'annual', 'year so far'):
-        period = 'year'
-    else:
-        period = 'today'
+    period = args.get('period', 'today').lower()
     try:
         start_utc, end_utc = get_local_date_range(phone, period)
         cal, pro, carbs, fat, count = sum_food_log(phone, start_utc, end_utc)
         if count == 0:
-            labels = {'today': 'today', 'week': 'this week', 'month': 'this month', 'year': 'this year'}
-            return f"Nothing logged {labels.get(period, 'today')} yet."
-        labels = {'today': 'Today', 'week': 'This week', 'month': 'This month', 'year': 'This year'}
-        label = labels.get(period, 'Today')
-        goal_text = ""
-        try:
-            params = {"filterByFormula": f"{{Phone}}='{phone}'", "fields[]": ["Calorie Goal"], "maxRecords": 1}
-            user_records = airtable_get("Users", params)
-            if user_records:
-                goal = user_records[0].get('fields', {}).get('Calorie Goal')
-                if goal and period == 'today':
-                    goal = int(goal)
-                    remaining = goal - cal
-                    if remaining > 0:
-                        goal_text = f" You have {remaining} calories left of your {goal} goal."
-                    else:
-                        over = abs(remaining)
-                        goal_text = f" You're {over} calories over your {goal} goal."
-        except Exception:
-            pass
-        return f"{label}: {cal} calories, {pro}g protein, {carbs}g carbs, {fat}g fat.{goal_text}"
+            label = {'today': 'today', 'week': 'this week', 'month': 'this month', 'year': 'this year'}.get(period, period)
+            return f"No food logged {label} yet."
+        label = {'today': 'today', 'week': 'this week', 'month': 'this month', 'year': 'this year'}.get(period, period)
+        user = get_user_fast(phone)
+        goal = None
+        if user:
+            try:
+                params = {"filterByFormula": f"{{Phone}}='{phone}'", "maxRecords": 1}
+                records = airtable_get("Users", params)
+                if records:
+                    goal = records[0].get('fields', {}).get('Calorie Goal')
+            except Exception:
+                pass
+        summary = f"{label.capitalize()}: {cal:,} calories, {pro}g protein, {carbs}g carbs, {fat}g fat"
+        if goal and period == 'today':
+            remaining = int(float(goal)) - cal
+            if remaining > 0:
+                summary += f". You have {remaining:,} calories left for the day."
+            else:
+                summary += f". You're {abs(remaining):,} calories over your goal."
+        return summary
     except Exception as e:
-        app.logger.error(f"handle_get_totals error: {e}", exc_info=True)
-        return "I couldn't get your totals right now. Try again in a moment."
+        app.logger.error(f"handle_get_totals error: {e}")
+        return "Could not retrieve totals right now."
 
 def handle_save_profile(phone, args):
     try:
         params = {"filterByFormula": f"{{Phone}}='{phone}'", "maxRecords": 1}
         records = airtable_get("Users", params)
         fields = {"Phone": phone}
-        if args.get('timezone'):
-            fields["Timezone"] = str(args['timezone'])
         if args.get('name'):
-            fields["Name"] = str(args['name'])
+            fields['Name'] = str(args['name'])
         if args.get('email'):
-            fields["Email"] = str(args['email'])
+            fields['Email'] = str(args['email'])
+        if args.get('timezone'):
+            fields['Timezone'] = str(args['timezone'])
         if args.get('calorie_goal'):
             try:
                 fields["Calorie Goal"] = float(args['calorie_goal'])
@@ -276,6 +261,9 @@ def handle_save_profile(phone, args):
             airtable_patch("Users", records[0]['id'], fields)
         else:
             airtable_post("Users", fields)
+        # Invalidate cache so next call gets fresh data
+        with _cache_lock:
+            _user_cache.pop(phone, None)
         parts = []
         if args.get('timezone'):
             parts.append(f"timezone set to {args['timezone']}")
@@ -337,26 +325,28 @@ def handle_save_meal_plan(phone, args):
     meal  = args.get('meal', '')
     foods = args.get('foods', '')
     try:
-        airtable_post("Meal Plans", {"Phone": phone, "Day": str(day), "Meal": str(meal), "Foods": str(foods), "Saved At": now_utc()})
-        return f"Saved {meal} for {day} — {foods}."
+        params = {"filterByFormula": f"AND({{Phone}}='{phone}',{{Day}}='{day}',{{Meal}}='{meal}')", "maxRecords": 1}
+        records = airtable_get("Meal Plan", params)
+        if records:
+            airtable_patch("Meal Plan", records[0]['id'], {"Foods": str(foods)})
+        else:
+            airtable_post("Meal Plan", {"Phone": phone, "Day": str(day), "Meal": str(meal), "Foods": str(foods)})
+        return f"Saved {meal} for {day}."
     except Exception as e:
         app.logger.error(f"handle_save_meal_plan error: {e}")
         return "Saved."
 
 def handle_send_summary_email(phone, args):
     import threading
-
     def send_async():
         try:
             from sendgrid import SendGridAPIClient
             from sendgrid.helpers.mail import Mail
-
             SENDGRID_KEY = os.environ.get('SENDGRID_API_KEY', '')
             FROM_EMAIL   = os.environ.get('FROM_EMAIL', 'Sheldon@matcedi.com')
             if not SENDGRID_KEY:
                 app.logger.error('SENDGRID_API_KEY not set')
                 return
-
             params = {'filterByFormula': f"{{Phone}}='{phone}'", 'maxRecords': 1}
             records = airtable_get('Users', params)
             if not records:
@@ -365,14 +355,13 @@ def handle_send_summary_email(phone, args):
             user_fields = records[0].get('fields', {})
             email = user_fields.get('Email', '')
             name  = user_fields.get('Name', 'there')
+            tz    = user_fields.get('Timezone', 'UTC')
             goal  = user_fields.get('Calorie Goal')
             if not email:
                 app.logger.warning(f'No email for {phone}')
                 return
-
             start_utc, end_utc = get_local_date_range(phone, 'week')
             cal, pro, carbs, fat, count = sum_food_log(phone, start_utc, end_utc)
-
             first_name = name.split()[0] if name and name != 'there' else 'there'
             goal_line = ''
             if goal and count > 0:
@@ -381,7 +370,6 @@ def handle_send_summary_email(phone, args):
                     goal_line = f'<p style="color:#2e7d32;">On track — averaging {int(avg)} cal/day vs your {int(float(goal))} goal.</p>'
                 else:
                     goal_line = f'<p style="color:#e65100;">Slightly over — averaging {int(avg)} cal/day vs your {int(float(goal))} goal.</p>'
-
             html = f"""<!DOCTYPE html>
 <html><body style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;">
 <div style="background:#1a1a2e;padding:24px;border-radius:8px 8px 0 0;text-align:center;">
@@ -409,39 +397,28 @@ def handle_send_summary_email(phone, args):
   </div>
 </div>
 </body></html>"""
-
-            message = Mail(
-                from_email=(FROM_EMAIL, 'VoiceTrim'),
-                to_emails=email,
-                subject='Your VoiceTrim Weekly Summary',
-                html_content=html
-            )
+            message = Mail(from_email=(FROM_EMAIL, 'VoiceTrim'), to_emails=email,
+                           subject='Your VoiceTrim Weekly Summary', html_content=html)
             sg = SendGridAPIClient(SENDGRID_KEY)
             sg.send(message)
             app.logger.info(f'Weekly summary sent to {email}')
         except Exception as e:
             app.logger.error(f'send_summary_email error: {e}', exc_info=True)
-
     threading.Thread(target=send_async, daemon=True).start()
     return "I'll send your nutrition summary to your email shortly."
 
 def handle_get_user_profile(phone, args):
     try:
-        params = {"filterByFormula": f"{{Phone}}='{phone}'", "maxRecords": 1}
-        records = airtable_get("Users", params)
-        if not records:
+        user = get_user_fast(phone)
+        if not user or user['is_new']:
             return "Hey, welcome to VoiceTrim! I'm your personal nutrition assistant. What's your name?"
-        fields = records[0].get('fields', {})
-        name  = fields.get('Name') or ''
-        email = fields.get('Email') or ''
-        is_new = not name and not email
-        if is_new:
-            return "Hey, welcome to VoiceTrim! I'm your personal nutrition assistant. What's your name?"
-        first_name = name.split()[0] if name else 'there'
+        first_name = user['first_name'] or 'there'
         return f"Hey {first_name}, what are we logging today?"
     except Exception as e:
         app.logger.error(f"handle_get_user_profile error: {e}")
         return "Hey, welcome to VoiceTrim! What's your name?"
+
+# ── Tool dispatch ─────────────────────────────────────────────────────────────
 
 TOOL_HANDLERS = {
     'log_food':           lambda phone, call_id, args: handle_log_food(phone, call_id, args),
@@ -494,19 +471,12 @@ def call_start():
 
         first_name = 'there'
         is_new = True
+
         if phone:
-            try:
-                params = {"filterByFormula": f"{{Phone}}='{phone}'", "maxRecords": 1}
-                records = airtable_get("Users", params)
-                if records:
-                    fields = records[0].get('fields', {})
-                    name = fields.get('Name', '')
-                    email = fields.get('Email', '')
-                    if name or email:
-                        is_new = False
-                        first_name = name.split()[0] if name else 'there'
-            except Exception as e:
-                app.logger.warning(f"call-start lookup error: {e}")
+            user = get_user_fast(phone)
+            if user and not user['is_new']:
+                first_name = user['first_name'] or 'there'
+                is_new = False
 
         if is_new:
             greeting = "Hey there, welcome to VoiceTrim! I'm your personal nutrition assistant. What's your name?"
@@ -523,7 +493,7 @@ def call_start():
         })
     except Exception as e:
         app.logger.error(f"call-start error: {e}", exc_info=True)
-        return jsonify({"variableValues": {"greeting": "Hey there, what are we logging today?", "first_name": "there", "is_new_user": "false"}})
+        return jsonify({"variableValues": {"greeting": "Hey, what are we logging today?", "first_name": "there", "is_new_user": "false"}})
 
 @app.route('/health', methods=['GET'])
 def health():
