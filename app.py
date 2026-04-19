@@ -1,3 +1,4 @@
+
 from flask import Flask, request, jsonify
 import requests
 import json
@@ -97,9 +98,6 @@ def handle_log_food(phone, call_id, args):
                 fields[field] = float(val)
             except (ValueError, TypeError):
                 pass
-    meal_type = args.get('meal_type')
-    if meal_type:
-        fields["Meal Type"] = meal_type
     if call_id:
         fields["Call ID"] = call_id
     resp = airtable_post("Food Log", fields)
@@ -159,7 +157,7 @@ def handle_log_usual(phone, call_id, args):
         f = records[0].get('fields', {})
         foods_str = f.get('Foods', '')
         for food in [x.strip() for x in foods_str.split(',') if x.strip()]:
-            handle_log_food(phone, call_id, {'food_name': food, 'meal_type': args.get('meal_type', '')})
+            handle_log_food(phone, call_id, {'food_name': food})
         return f"Logged your usual '{meal_name}'."
     except Exception as e:
         app.logger.error(f"handle_log_usual error: {e}")
