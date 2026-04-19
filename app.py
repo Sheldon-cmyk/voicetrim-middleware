@@ -6,7 +6,7 @@ import os
 import re
 from datetime import datetime, timezone, timedelta
 
-app = Flask(__name__ )
+app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
 AIRTABLE_TOKEN = os.environ["AIRTABLE_TOKEN"]
@@ -146,6 +146,23 @@ def sum_food_log(phone, start_utc, end_utc):
     carbs = sum(float(r.get('fields', {}).get('Carbs',    0) or 0) for r in records)
     fat   = sum(float(r.get('fields', {}).get('Fat',      0) or 0) for r in records)
     return int(cal), int(pro), int(carbs), int(fat), len(records)
+
+def handle_get_user_profile(phone, args):
+    try:
+        params = {"filterByFormula": f"{{Phone}}='{phone}'", "maxRecords": 1}
+        records = airtable_get("Users", params)
+        if not records:
+            return json.dumps({"is_new": True, "name": None, "email": None, "timezone": None, "calorie_goal": None})
+        fields = records[0].get('fields', {})
+        name  = fields.get('Name') or None
+        email = fields.get('Email') or None
+        tz    = fields.get('Timezone') or None
+        goal  = fields.get('Calorie Goal') or None
+        is_new = not name and not email
+        return json.dumps({"is_new": is_new, "name": name, "email": email, "timezone": tz, "calorie_goal": goal})
+    except Exception as e:
+        app.logger.error(f"handle_get_user_profile error: {e}")
+        return json.dumps({"is_new": True, "name": None, "email": None, "timezone": None, "calorie_goal": None})
 
 def handle_log_food(phone, call_id, args):
     fields = {
@@ -365,6 +382,7 @@ def handle_send_summary_email(phone, args):
             name  = user_fields.get('Name', 'there')
             goal  = user_fields.get('Calorie Goal')
             if not email:
+                app.logger.warning(f'No email for {phone} — cannot send summary')
                 return
 
             start_utc, end_utc = get_local_date_range(phone, 'week')
@@ -432,6 +450,7 @@ TOOL_HANDLERS = {
     'log_shopping_item':  lambda phone, call_id, args: handle_log_shopping_item(phone, args),
     'save_meal_plan':     lambda phone, call_id, args: handle_save_meal_plan(phone, args),
     'send_summary_email': lambda phone, call_id, args: handle_send_summary_email(phone, args),
+    'get_user_profile':   lambda phone, call_id, args: handle_get_user_profile(phone, args),
 }
 
 @app.route('/tool/<tool_name>', methods=['POST'])
