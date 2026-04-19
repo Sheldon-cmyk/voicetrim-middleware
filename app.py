@@ -148,21 +148,31 @@ def sum_food_log(phone, start_utc, end_utc):
     return int(cal), int(pro), int(carbs), int(fat), len(records)
 
 def handle_get_user_profile(phone, args):
+    """Check if user exists — returns natural language instruction for the AI to act on silently."""
     try:
         params = {"filterByFormula": f"{{Phone}}='{phone}'", "maxRecords": 1}
         records = airtable_get("Users", params)
         if not records:
-            return json.dumps({"is_new": True, "name": None, "email": None, "timezone": None, "calorie_goal": None})
+            return "NEW USER: Welcome them to VoiceTrim and collect their name, email, timezone, and optional calorie goal one at a time."
         fields = records[0].get('fields', {})
-        name  = fields.get('Name') or None
-        email = fields.get('Email') or None
-        tz    = fields.get('Timezone') or None
-        goal  = fields.get('Calorie Goal') or None
+        name  = fields.get('Name') or ''
+        email = fields.get('Email') or ''
+        tz    = fields.get('Timezone') or ''
+        goal  = fields.get('Calorie Goal') or ''
         is_new = not name and not email
-        return json.dumps({"is_new": is_new, "name": name, "email": email, "timezone": tz, "calorie_goal": goal})
+        if is_new:
+            return "NEW USER: Welcome them to VoiceTrim and collect their name, email, timezone, and optional calorie goal one at a time."
+        parts = []
+        if name:  parts.append(f"Name: {name}")
+        if email: parts.append(f"Email: {email}")
+        if tz:    parts.append(f"Timezone: {tz}")
+        if goal:  parts.append(f"Calorie goal: {int(float(goal))} calories/day")
+        profile_str = ", ".join(parts) if parts else "no profile details saved"
+        greeting_name = name.split()[0] if name else "there"
+        return f"RETURNING USER. {profile_str}. Greet them as 'Hey {greeting_name}, what are we logging today?' and go straight to helping them."
     except Exception as e:
         app.logger.error(f"handle_get_user_profile error: {e}")
-        return json.dumps({"is_new": True, "name": None, "email": None, "timezone": None, "calorie_goal": None})
+        return "NEW USER: Welcome them to VoiceTrim and collect their name, email, timezone, and optional calorie goal one at a time."
 
 def handle_log_food(phone, call_id, args):
     fields = {
