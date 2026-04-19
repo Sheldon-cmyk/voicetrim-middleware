@@ -3,6 +3,7 @@ import requests
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone, timedelta
 
 app = Flask(__name__ )
@@ -48,32 +49,41 @@ def airtable_patch(table, record_id, fields):
     resp = requests.patch(url, headers=AIRTABLE_HEADERS, json={"fields": fields}, timeout=10)
     return resp
 
+def airtable_delete(table, record_id):
+    url = f"https://api.airtable.com/v0/{AIRTABLE_BASE}/{requests.utils.quote(table )}/{record_id}"
+    resp = requests.delete(url, headers=AIRTABLE_HEADERS, timeout=10)
+    return resp
+
 def now_utc():
     return datetime.now(timezone.utc).isoformat()
 
 TIMEZONE_OFFSETS = {
-    'est': -5, 'edt': -4, 'eastern': -5,
-    'cst': -6, 'cdt': -5, 'central': -6,
-    'mst': -7, 'mdt': -6, 'mountain': -7,
-    'pst': -8, 'pdt': -7, 'pacific': -8,
-    'akst': -9, 'akdt': -8, 'alaska': -9,
-    'hst': -10, 'hawaii': -10,
-    'gmt': 0, 'utc': 0,
-    'bst': 1, 'ist': 1,
-    'cet': 1, 'cest': 2,
-    'eet': 2, 'eest': 3,
-    'msk': 3,
-    'ist_india': 5.5, 'india': 5.5,
-    'cst_china': 8, 'china': 8, 'sgt': 8, 'singapore': 8,
-    'jst': 9, 'japan': 9, 'kst': 9, 'korea': 9,
-    'aest': 10, 'aedt': 11, 'australia_east': 10,
-    'nzst': 12, 'nzdt': 13,
-    'eat': 3, 'cat': 2, 'wat': 1,
-    'gst': 4,
-    'art': -3, 'brt': -3, 'brazil': -3,
-    'clst': -3, 'clt': -4, 'chile': -4,
-    'pert': -5, 'colombia': -5,
-    'mxt': -6, 'mexico': -6,
+    'est': -5, 'edt': -4, 'eastern': -5, 'new york': -5, 'miami': -5, 'boston': -5, 'atlanta': -5,
+    'cst': -6, 'cdt': -5, 'central': -6, 'chicago': -6, 'dallas': -6, 'houston': -6,
+    'mst': -7, 'mdt': -6, 'mountain': -7, 'denver': -7, 'phoenix': -7,
+    'pst': -8, 'pdt': -7, 'pacific': -8, 'los angeles': -8, 'seattle': -8, 'san francisco': -8,
+    'akst': -9, 'akdt': -8, 'alaska': -9, 'anchorage': -9,
+    'hst': -10, 'hawaii': -10, 'honolulu': -10,
+    'gmt': 0, 'utc': 0, 'london': 0,
+    'bst': 1, 'ireland': 1, 'dublin': 1,
+    'cet': 1, 'cest': 2, 'paris': 1, 'berlin': 1, 'rome': 1, 'madrid': 1, 'amsterdam': 1,
+    'eet': 2, 'eest': 3, 'athens': 2, 'cairo': 2, 'johannesburg': 2,
+    'msk': 3, 'moscow': 3, 'riyadh': 3, 'dubai': 4, 'abu dhabi': 4,
+    'karachi': 5, 'islamabad': 5,
+    'india': 5.5, 'ist': 5.5, 'mumbai': 5.5, 'delhi': 5.5, 'bangalore': 5.5,
+    'dhaka': 6, 'colombo': 5.5,
+    'bangkok': 7, 'jakarta': 7, 'hanoi': 7,
+    'china': 8, 'beijing': 8, 'shanghai': 8, 'singapore': 8, 'sgt': 8,
+    'hong kong': 8, 'taipei': 8, 'perth': 8,
+    'japan': 9, 'jst': 9, 'tokyo': 9, 'osaka': 9, 'korea': 9, 'kst': 9, 'seoul': 9,
+    'aest': 10, 'sydney': 10, 'melbourne': 10, 'brisbane': 10,
+    'aedt': 11, 'adelaide': 9.5,
+    'nzst': 12, 'auckland': 12, 'nzdt': 13,
+    'brazil': -3, 'brt': -3, 'sao paulo': -3, 'rio': -3,
+    'argentina': -3, 'buenos aires': -3,
+    'chile': -4, 'colombia': -5, 'bogota': -5, 'lima': -5, 'peru': -5,
+    'mexico': -6, 'mexico city': -6,
+    'nigeria': 1, 'lagos': 1, 'nairobi': 3, 'eat': 3,
 }
 
 def get_user_timezone(phone):
@@ -92,7 +102,6 @@ def parse_timezone_to_offset(tz_str):
     if not tz_str:
         return 0
     tz_lower = tz_str.lower().strip()
-    import re
     match = re.search(r'([+-])(\d{1,2})(?::(\d{2}))?', tz_str)
     if match:
         sign = 1 if match.group(1) == '+' else -1
@@ -137,13 +146,8 @@ def sum_food_log(phone, start_utc, end_utc):
     return int(cal), int(pro), int(carbs), int(fat), len(records)
 
 def handle_log_food(phone, call_id, args):
-    fields = {
-        "Phone": phone,
-        "Food Name": str(args.get('food_name', '')),
-        "Logged At": now_utc(),
-    }
-    for field, key in [("Calories", "calories"), ("Protein", "protein"),
-                        ("Carbs", "carbs"), ("Fat", "fat")]:
+    fields = {"Phone": phone, "Food Name": str(args.get('food_name', '')), "Logged At": now_utc()}
+    for field, key in [("Calories", "calories"), ("Protein", "protein"), ("Carbs", "carbs"), ("Fat", "fat")]:
         val = args.get(key)
         if val is not None:
             try:
@@ -158,13 +162,43 @@ def handle_log_food(phone, call_id, args):
     cal = args.get('calories', '')
     return f"Logged {food}" + (f" at {cal} calories" if cal else "")
 
+def handle_delete_food(phone, args):
+    food_name = str(args.get('food_name', '')).strip()
+    if not food_name:
+        return "Which item would you like me to remove?"
+    start_utc, end_utc = get_local_date_range(phone, 'today')
+    formula = (f"AND({{Phone}}='{phone}', {{Logged At}} >= '{start_utc}', {{Logged At}} <= '{end_utc}', "
+               f"FIND(LOWER('{food_name.lower()}'), LOWER({{Food Name}})) > 0)")
+    params = {"filterByFormula": formula, "sort[0][field]": "Logged At", "sort[0][direction]": "desc", "maxRecords": 1}
+    try:
+        records = airtable_get("Food Log", params)
+        if not records:
+            start_utc2, end_utc2 = get_local_date_range(phone, 'week')
+            formula2 = (f"AND({{Phone}}='{phone}', {{Logged At}} >= '{start_utc2}', "
+                        f"FIND(LOWER('{food_name.lower()}'), LOWER({{Food Name}})) > 0)")
+            params2 = {"filterByFormula": formula2, "sort[0][field]": "Logged At", "sort[0][direction]": "desc", "maxRecords": 1}
+            records = airtable_get("Food Log", params2)
+        if not records:
+            return f"I don't see {food_name} in your recent logs. Nothing was removed."
+        record = records[0]
+        actual_name = record.get('fields', {}).get('Food Name', food_name)
+        del_resp = airtable_delete("Food Log", record['id'])
+        if del_resp.status_code == 200:
+            app.logger.info(f"delete_food: removed '{actual_name}' for {phone}")
+            return f"Done, removed {actual_name} from your log."
+        else:
+            return f"Something went wrong removing {food_name}. Please try again."
+    except Exception as e:
+        app.logger.error(f"handle_delete_food error: {e}", exc_info=True)
+        return "I had trouble removing that. Please try again."
+
 def handle_get_totals(phone, args):
     period = str(args.get('period', 'today')).lower().strip()
-    if period in ('week', 'this week', 'weekly'):
+    if period in ('week', 'this week', 'weekly', 'week so far'):
         period = 'week'
-    elif period in ('month', 'this month', 'monthly'):
+    elif period in ('month', 'this month', 'monthly', 'month so far'):
         period = 'month'
-    elif period in ('year', 'this year', 'yearly', 'annual'):
+    elif period in ('year', 'this year', 'yearly', 'annual', 'year so far'):
         period = 'year'
     else:
         period = 'today'
@@ -173,13 +207,28 @@ def handle_get_totals(phone, args):
         cal, pro, carbs, fat, count = sum_food_log(phone, start_utc, end_utc)
         if count == 0:
             labels = {'today': 'today', 'week': 'this week', 'month': 'this month', 'year': 'this year'}
-            return f"No food logged {labels.get(period, 'today')} yet."
+            return f"Nothing logged {labels.get(period, 'today')} yet."
         labels = {'today': 'Today', 'week': 'This week', 'month': 'This month', 'year': 'This year'}
         label = labels.get(period, 'Today')
-        return f"{label}: {cal} calories, {pro}g protein, {carbs}g carbs, {fat}g fat."
+        goal_text = ""
+        try:
+            params = {"filterByFormula": f"{{Phone}}='{phone}'", "fields[]": ["Calorie Goal"], "maxRecords": 1}
+            user_records = airtable_get("Users", params)
+            if user_records and period == 'today':
+                goal = user_records[0].get('fields', {}).get('Calorie Goal')
+                if goal:
+                    goal = int(goal)
+                    remaining = goal - cal
+                    if remaining > 0:
+                        goal_text = f" {remaining} calories left of your {goal} goal."
+                    else:
+                        goal_text = f" {abs(remaining)} calories over your {goal} goal."
+        except Exception:
+            pass
+        return f"{label}: {cal} calories, {pro}g protein, {carbs}g carbs, {fat}g fat.{goal_text}"
     except Exception as e:
         app.logger.error(f"handle_get_totals error: {e}", exc_info=True)
-        return "I couldn't retrieve your totals right now. Please try again."
+        return "I couldn't get your totals right now. Try again in a moment."
 
 def handle_save_profile(phone, args):
     try:
@@ -192,22 +241,40 @@ def handle_save_profile(phone, args):
             fields["Name"] = str(args['name'])
         if args.get('email'):
             fields["Email"] = str(args['email'])
+        if args.get('calorie_goal'):
+            try:
+                fields["Calorie Goal"] = float(args['calorie_goal'])
+            except (ValueError, TypeError):
+                pass
         if records:
             airtable_patch("Users", records[0]['id'], fields)
         else:
             airtable_post("Users", fields)
-        tz = args.get('timezone', '')
-        return f"Profile saved." + (f" Timezone set to {tz}." if tz else "")
+        parts = []
+        if args.get('timezone'):
+            parts.append(f"timezone set to {args['timezone']}")
+        if args.get('name'):
+            parts.append("name saved")
+        if args.get('email'):
+            parts.append("email saved")
+        if args.get('calorie_goal'):
+            parts.append(f"calorie goal set to {args['calorie_goal']}")
+        return "Got it, " + ", ".join(parts) + "." if parts else "Profile saved."
     except Exception as e:
         app.logger.error(f"handle_save_profile error: {e}")
-        return "Profile saved."
+        return "Saved."
 
 def handle_save_usual(phone, args):
     meal_name = args.get('meal_name', '')
     foods = args.get('foods', '')
     try:
-        airtable_post("Usual Meals", {"Phone": phone, "Meal Name": str(meal_name), "Foods": str(foods), "Saved At": now_utc()})
-        return f"Saved '{meal_name}' as a usual meal."
+        params = {"filterByFormula": f"AND({{Phone}}='{phone}', {{Meal Name}}='{meal_name}')", "maxRecords": 1}
+        records = airtable_get("Usual Meals", params)
+        if records:
+            airtable_patch("Usual Meals", records[0]['id'], {"Foods": str(foods), "Saved At": now_utc()})
+        else:
+            airtable_post("Usual Meals", {"Phone": phone, "Meal Name": str(meal_name), "Foods": str(foods), "Saved At": now_utc()})
+        return f"Saved your usual {meal_name}."
     except Exception as e:
         app.logger.error(f"handle_save_usual error: {e}")
         return "Saved."
@@ -218,18 +285,20 @@ def handle_log_usual(phone, call_id, args):
         params = {"filterByFormula": f"AND({{Phone}}='{phone}', {{Meal Name}}='{meal_name}')", "maxRecords": 1}
         records = airtable_get("Usual Meals", params)
         if not records:
-            return f"I couldn't find a usual meal called '{meal_name}'."
+            return f"I don't have a usual meal saved called '{meal_name}'. Want me to save one?"
         foods_str = records[0].get('fields', {}).get('Foods', '')
+        logged = []
         for food in [x.strip() for x in foods_str.split(',') if x.strip()]:
             handle_log_food(phone, call_id, {'food_name': food})
-        return f"Logged your usual '{meal_name}'."
+            logged.append(food)
+        return f"Logged your usual {meal_name}."
     except Exception as e:
         app.logger.error(f"handle_log_usual error: {e}")
         return "Logged."
 
 def handle_log_shopping_item(phone, args):
     item = args.get('item', '')
-    qty  = args.get('quantity', '')
+    qty = args.get('quantity', '')
     try:
         airtable_post("Shopping List", {"Phone": phone, "Item": str(item), "Quantity": str(qty), "Added At": now_utc()})
         return f"Added {item} to your shopping list."
@@ -243,17 +312,18 @@ def handle_save_meal_plan(phone, args):
     foods = args.get('foods', '')
     try:
         airtable_post("Meal Plans", {"Phone": phone, "Day": str(day), "Meal": str(meal), "Foods": str(foods), "Saved At": now_utc()})
-        return f"Saved meal plan for {day} {meal}."
+        return f"Saved {meal} for {day}."
     except Exception as e:
         app.logger.error(f"handle_save_meal_plan error: {e}")
         return "Saved."
 
 def handle_send_summary_email(phone, args):
     app.logger.info(f"send_summary_email requested for {phone}")
-    return "I'll send your summary shortly."
+    return "I'll send your nutrition summary to your email shortly."
 
 TOOL_HANDLERS = {
     'log_food':           lambda phone, call_id, args: handle_log_food(phone, call_id, args),
+    'delete_food':        lambda phone, call_id, args: handle_delete_food(phone, args),
     'get_totals':         lambda phone, call_id, args: handle_get_totals(phone, args),
     'save_profile':       lambda phone, call_id, args: handle_save_profile(phone, args),
     'save_usual':         lambda phone, call_id, args: handle_save_usual(phone, args),
@@ -293,11 +363,11 @@ def handle_tool(tool_name):
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({"status": "ok", "service": "VoiceTrim Middleware"})
+    return jsonify({"status": "ok", "service": "VoiceTrim Middleware", "version": "2.0"})
 
 @app.route('/', methods=['GET'])
 def index():
-    return jsonify({"service": "VoiceTrim Middleware", "status": "running"})
+    return jsonify({"service": "VoiceTrim Middleware", "status": "running", "version": "2.0"})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5556))
