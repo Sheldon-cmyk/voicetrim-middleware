@@ -14,13 +14,20 @@ logging.basicConfig(level=logging.INFO)
 AIRTABLE_TOKEN = os.environ["AIRTABLE_TOKEN"]
 AIRTABLE_BASE = os.environ["AIRTABLE_BASE"]
 
+# ── Paywall configuration ─────────────────────────────────────────────────────
+# URL of the landing page server's subscription check endpoint
+LANDING_PAGE_URL = os.environ.get('LANDING_PAGE_URL', 'https://voicetrim-landing.manus.space')
+# Shared secret key that authenticates this middleware to the landing page server
+VOICE_GATEWAY_API_KEY = os.environ.get('VOICE_GATEWAY_API_KEY', '')
+# Set to 'true' to bypass the paywall gate (useful for testing)
+PAYWALL_BYPASS = os.environ.get('PAYWALL_BYPASS', 'false').lower() == 'true'
+
 AIRTABLE_HEADERS = {
     "Authorization": f"Bearer {AIRTABLE_TOKEN}",
     "Content-Type": "application/json"
 }
 
 # ── In-memory user cache for instant call-start greetings ─────────────────────
-# Structure: {phone: {'first_name': str, 'email': str, 'timezone': str, 'is_new': bool, 'cached_at': float}}
 _user_cache = {}
 _cache_lock = threading.Lock()
 CACHE_TTL = 300  # 5 minutes
@@ -43,7 +50,6 @@ def _get_cached_user(phone):
     return None
 
 def _refresh_cache_bg(phone):
-    """Refresh a single user's cache entry from Airtable in the background."""
     def _do():
         try:
             params = {"filterByFormula": f"{{Phone}}='{phone}'", "maxRecords": 1}
@@ -60,14 +66,11 @@ def _refresh_cache_bg(phone):
     threading.Thread(target=_do, daemon=True).start()
 
 def get_user_fast(phone):
-    """Get user info instantly from cache; trigger background refresh if stale."""
     cached = _get_cached_user(phone)
     if cached:
-        # If cache is > 4 minutes old, refresh in background for next call
         if (time.time() - cached['cached_at']) > 240:
             _refresh_cache_bg(phone)
         return cached
-    # Not cached — do a fast lookup and cache it
     try:
         params = {"filterByFormula": f"{{Phone}}='{phone}'", "maxRecords": 1}
         records = airtable_get("Users", params)
@@ -217,6 +220,37 @@ def sum_food_log(phone, start_utc, end_utc):
     fat   = sum(float(r.get('fields', {}).get('Fat',      0) or 0) for r in records)
     return int(cal), int(pro), int(carbs), int(fat), len(records)
 
+def get_user_profile_fields(phone):
+    """Get full user profile from Contacts table."""
+    try:
+        params = {"filterByFormula": f"{{Phone Number}}='{phone}'", "maxRecords": 1}
+        records = airtable_get("Contacts", params)
+        if records:
+            return records[0].get('fields', {}), records[0]['id']
+    except Exception:
+        pass
+    return {}, None
+
+def call_openai(system_prompt, user_prompt, max_tokens=800):
+    """Call OpenAI GPT-4.1-mini for AI-generated content."""
+    try:
+        import openai
+        api_key = os.environ.get('OPENAI_API_KEY', '')
+        client = openai.OpenAI(api_key=api_key)
+        response = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            max_tokens=max_tokens,
+            temperature=0.7
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        app.logger.error(f"OpenAI error: {e}")
+        return None
+
 # ── Tool handlers ─────────────────────────────────────────────────────────────
 
 def handle_log_food(phone, call_id, args):
@@ -243,12 +277,11 @@ def handle_log_food(phone, call_id, args):
     return f"Logged {food}" + (f" at {cal} calories" if cal else "")
 
 def handle_delete_food(phone, args):
-    """Delete a food entry by name — handles corrections like 'remove the cheese'."""
+    """Delete a food entry by name."""
     food_name = str(args.get('food_name', '')).strip()
     if not food_name:
         return "Which item would you like me to remove?"
 
-    # Search for the most recent matching entry today
     start_utc, end_utc = get_local_date_range(phone, 'today')
     formula = (
         f"AND({{Phone}}='{phone}', "
@@ -265,7 +298,6 @@ def handle_delete_food(phone, args):
     try:
         records = airtable_get("Food Log", params)
         if not records:
-            # Try broader search — last 7 days
             start_utc2, end_utc2 = get_local_date_range(phone, 'week')
             formula2 = (
                 f"AND({{Phone}}='{phone}', "
@@ -290,13 +322,12 @@ def handle_delete_food(phone, args):
 
         del_resp = airtable_delete("Food Log", record_id)
         if del_resp.status_code == 200:
-            app.logger.info(f"delete_food: removed '{actual_name}' ({cal} cal) for {phone}")
             return f"Done, removed {actual_name} from your log."
         else:
             return f"Something went wrong removing {food_name}. Please try again."
     except Exception as e:
         app.logger.error(f"handle_delete_food error: {e}", exc_info=True)
-        return f"I had trouble removing that. Please try again."
+        return "I had trouble removing that. Please try again."
 
 def handle_get_totals(phone, args):
     """Get nutrition totals for today, week, month, or year."""
@@ -318,7 +349,6 @@ def handle_get_totals(phone, args):
         labels = {'today': 'Today', 'week': 'This week', 'month': 'This month', 'year': 'This year'}
         label = labels.get(period, 'Today')
 
-        # Check if user has a calorie goal
         goal_text = ""
         try:
             params = {"filterByFormula": f"{{Phone}}='{phone}'", "fields[]": ["Calorie Goal"], "maxRecords": 1}
@@ -381,13 +411,12 @@ def handle_save_usual(phone, args):
     meal_name = args.get('meal_name', '')
     foods = args.get('foods', '')
     try:
-        # Check if it already exists and update it
         params = {"filterByFormula": f"AND({{Phone}}='{phone}', {{Meal Name}}='{meal_name}')", "maxRecords": 1}
-        records = airtable_get("Usual Meals", params)
+        records = airtable_get("Usuals", params)
         if records:
-            airtable_patch("Usual Meals", records[0]['id'], {"Foods": str(foods), "Saved At": now_utc()})
+            airtable_patch("Usuals", records[0]['id'], {"Foods": str(foods)})
         else:
-            airtable_post("Usual Meals", {"Phone": phone, "Meal Name": str(meal_name), "Foods": str(foods), "Saved At": now_utc()})
+            airtable_post("Usuals", {"Phone": phone, "Meal Name": str(meal_name), "Foods": str(foods)})
         return f"Saved your usual {meal_name}."
     except Exception as e:
         app.logger.error(f"handle_save_usual error: {e}")
@@ -398,7 +427,7 @@ def handle_log_usual(phone, call_id, args):
     meal_name = args.get('meal_name', '')
     try:
         params = {"filterByFormula": f"AND({{Phone}}='{phone}', {{Meal Name}}='{meal_name}')", "maxRecords": 1}
-        records = airtable_get("Usual Meals", params)
+        records = airtable_get("Usuals", params)
         if not records:
             return f"I don't have a usual meal saved called '{meal_name}'. Want me to save one?"
         foods_str = records[0].get('fields', {}).get('Foods', '')
@@ -416,7 +445,13 @@ def handle_log_shopping_item(phone, args):
     item = args.get('item', '')
     qty  = args.get('quantity', '')
     try:
-        airtable_post("Shopping List", {"Phone": phone, "Item": str(item), "Quantity": str(qty), "Added At": now_utc()})
+        airtable_post("Shopping List", {
+            "Phone": phone,
+            "Item Name": str(item),
+            "Quantity": str(qty),
+            "Session Date": datetime.now(timezone.utc).strftime('%Y-%m-%d'),
+            "In Cart": False
+        })
         return f"Added {item} to your shopping list."
     except Exception as e:
         app.logger.error(f"handle_log_shopping_item error: {e}")
@@ -428,7 +463,13 @@ def handle_save_meal_plan(phone, args):
     meal  = args.get('meal', '')
     foods = args.get('foods', '')
     try:
-        airtable_post("Meal Plans", {"Phone": phone, "Day": str(day), "Meal": str(meal), "Foods": str(foods), "Saved At": now_utc()})
+        airtable_post("Meal Plan", {
+            "Phone": phone,
+            "Day": str(day),
+            "Meal Type": str(meal),
+            "Foods": str(foods),
+            "Week Of": datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        })
         return f"Saved {meal} for {day} — {foods}."
     except Exception as e:
         app.logger.error(f"handle_save_meal_plan error: {e}")
@@ -436,8 +477,6 @@ def handle_save_meal_plan(phone, args):
 
 def handle_send_summary_email(phone, args):
     """Send weekly nutrition summary email to the user via SendGrid."""
-    import threading
-
     def send_async():
         try:
             from sendgrid import SendGridAPIClient
@@ -449,22 +488,17 @@ def handle_send_summary_email(phone, args):
                 app.logger.error('SENDGRID_API_KEY not set')
                 return
 
-            # Get user info
             params = {'filterByFormula': f"{{Phone}}='{phone}'", 'maxRecords': 1}
             records = airtable_get('Users', params)
             if not records:
-                app.logger.warning(f'No user record for {phone}')
                 return
             user_fields = records[0].get('fields', {})
             email = user_fields.get('Email', '')
             name  = user_fields.get('Name', 'there')
-            tz    = user_fields.get('Timezone', 'UTC')
             goal  = user_fields.get('Calorie Goal')
             if not email:
-                app.logger.warning(f'No email for {phone}')
                 return
 
-            # Get this week's data
             start_utc, end_utc = get_local_date_range(phone, 'week')
             cal, pro, carbs, fat, count = sum_food_log(phone, start_utc, end_utc)
 
@@ -521,7 +555,7 @@ def handle_send_summary_email(phone, args):
     return "I'll send your nutrition summary to your email shortly."
 
 def handle_get_user_profile(phone, args):
-    """Returns the exact opening line the AI should say to the caller."""
+    """Returns the opening greeting for the caller."""
     try:
         params = {"filterByFormula": f"{{Phone}}='{phone}'", "maxRecords": 1}
         records = airtable_get("Users", params)
@@ -539,19 +573,668 @@ def handle_get_user_profile(phone, args):
         app.logger.error(f"handle_get_user_profile error: {e}")
         return "Hey, welcome to VoiceTrim! What's your name?"
 
+# ── NEW: Goal Setting ─────────────────────────────────────────────────────────
+
+def handle_set_goal(phone, args):
+    """Save user's fitness goal and calculate daily calorie/macro targets."""
+    try:
+        goal_type     = str(args.get('goal_type', '')).strip()       # lose_weight, gain_muscle, maintain
+        current_weight = args.get('current_weight')                   # lbs
+        target_weight  = args.get('target_weight')                    # lbs
+        height_inches  = args.get('height_inches')                    # total inches
+        age            = args.get('age')
+        gender         = str(args.get('gender', 'unknown')).lower()
+        activity_level = str(args.get('activity_level', 'moderate')).lower()  # sedentary, light, moderate, active, very_active
+        timeline_weeks = args.get('timeline_weeks', 12)
+
+        # Calculate BMR using Mifflin-St Jeor
+        calorie_goal = 2000  # default
+        protein_goal = 150
+        carb_goal    = 200
+        fat_goal     = 65
+
+        if current_weight and height_inches and age:
+            weight_kg = float(current_weight) * 0.453592
+            height_cm = float(height_inches) * 2.54
+            age_val   = float(age)
+
+            if gender in ('male', 'm'):
+                bmr = 10 * weight_kg + 6.25 * height_cm - 5 * age_val + 5
+            else:
+                bmr = 10 * weight_kg + 6.25 * height_cm - 5 * age_val - 161
+
+            activity_multipliers = {
+                'sedentary': 1.2, 'light': 1.375, 'moderate': 1.55,
+                'active': 1.725, 'very_active': 1.9
+            }
+            multiplier = activity_multipliers.get(activity_level, 1.55)
+            tdee = bmr * multiplier
+
+            if goal_type == 'lose_weight':
+                calorie_goal = int(tdee - 500)   # 1 lb/week deficit
+                protein_goal = int(float(current_weight) * 0.8)  # 0.8g per lb
+                fat_goal     = int(calorie_goal * 0.25 / 9)
+                carb_goal    = int((calorie_goal - protein_goal * 4 - fat_goal * 9) / 4)
+            elif goal_type == 'gain_muscle':
+                calorie_goal = int(tdee + 300)   # lean bulk surplus
+                protein_goal = int(float(current_weight) * 1.0)  # 1g per lb
+                fat_goal     = int(calorie_goal * 0.25 / 9)
+                carb_goal    = int((calorie_goal - protein_goal * 4 - fat_goal * 9) / 4)
+            else:  # maintain
+                calorie_goal = int(tdee)
+                protein_goal = int(float(current_weight) * 0.7)
+                fat_goal     = int(calorie_goal * 0.30 / 9)
+                carb_goal    = int((calorie_goal - protein_goal * 4 - fat_goal * 9) / 4)
+
+            # Clamp to reasonable ranges
+            calorie_goal = max(1200, min(calorie_goal, 4000))
+            protein_goal = max(50, min(protein_goal, 300))
+            carb_goal    = max(50, min(carb_goal, 500))
+            fat_goal     = max(30, min(fat_goal, 150))
+
+        # Save to Contacts table
+        contact_fields, contact_id = get_user_profile_fields(phone)
+        update_fields = {
+            "Goal": goal_type,
+            "Calorie Goal": calorie_goal,
+            "Protein Goal": protein_goal,
+            "Carb Goal": carb_goal,
+            "Fat Goal": fat_goal,
+        }
+        if current_weight:
+            update_fields["Phone Number"] = phone  # ensure phone is set
+
+        if contact_id:
+            airtable_patch("Contacts", contact_id, update_fields)
+        else:
+            update_fields["Phone Number"] = phone
+            airtable_post("Contacts", update_fields)
+
+        # Also update Users table calorie goal for get_totals to use
+        params = {"filterByFormula": f"{{Phone}}='{phone}'", "maxRecords": 1}
+        user_records = airtable_get("Users", params)
+        if user_records:
+            airtable_patch("Users", user_records[0]['id'], {"Calorie Goal": calorie_goal})
+        else:
+            airtable_post("Users", {"Phone": phone, "Calorie Goal": calorie_goal})
+
+        goal_labels = {
+            'lose_weight': 'lose weight',
+            'gain_muscle': 'build muscle',
+            'maintain': 'maintain your weight'
+        }
+        goal_label = goal_labels.get(goal_type, goal_type)
+
+        app.logger.info(f"set_goal: {phone} goal={goal_type} cal={calorie_goal} pro={protein_goal}g")
+        return (f"Got it! Your goal is to {goal_label}. "
+                f"Your daily targets are {calorie_goal} calories, "
+                f"{protein_goal}g protein, {carb_goal}g carbs, and {fat_goal}g fat. "
+                f"Want me to create a 7-day meal plan based on these targets?")
+    except Exception as e:
+        app.logger.error(f"handle_set_goal error: {e}", exc_info=True)
+        return "I saved your goal. Want me to create a meal plan?"
+
+# ── NEW: Meal Plan Generator ──────────────────────────────────────────────────
+
+def handle_generate_meal_plan(phone, args):
+    """Generate a personalized 7-day meal plan using AI and save to Airtable (async)."""
+    preferences   = str(args.get('preferences', '')).strip()
+    dietary_notes = str(args.get('dietary_notes', '')).strip()
+
+    def _generate():
+        try:
+            contact_fields, _ = get_user_profile_fields(phone)
+            calorie_goal  = contact_fields.get('Calorie Goal', 2000)
+            protein_goal  = contact_fields.get('Protein Goal', 150)
+            carb_goal     = contact_fields.get('Carb Goal', 200)
+            fat_goal      = contact_fields.get('Fat Goal', 65)
+            goal_type     = contact_fields.get('Goal', 'maintain')
+
+            system_prompt = """You are a professional nutritionist creating a practical, realistic 7-day meal plan.
+Output ONLY a JSON array. Each entry has: day (Monday-Sunday), meal_type (Breakfast/Lunch/Dinner/Snack),
+meal_name (short), foods (comma-separated ingredients/items), calories (integer), protein (integer grams),
+carbs (integer grams), fat (integer grams).
+Keep meals simple, affordable, and easy to prepare. Use common grocery store items."""
+
+            user_prompt = f"""Create a 7-day meal plan (3 meals + 1 snack per day = 28 entries) for someone with:
+- Goal: {goal_type}
+- Daily targets: {calorie_goal} calories, {protein_goal}g protein, {carb_goal}g carbs, {fat_goal}g fat
+- Preferences: {preferences or 'none specified'}
+- Dietary notes: {dietary_notes or 'none'}
+
+Each day should hit close to the daily targets when meals are summed.
+Output ONLY valid JSON array, no markdown, no explanation."""
+
+            ai_response = call_openai(system_prompt, user_prompt, max_tokens=2000)
+            if not ai_response:
+                app.logger.error(f"generate_meal_plan: no AI response for {phone}")
+                return
+
+            clean = re.sub(r'```(?:json)?', '', ai_response).strip()
+            meal_entries = json.loads(clean)
+
+            # Clear existing meal plan
+            week_of = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+            existing = airtable_get("Meal Plan", {"filterByFormula": f"{{Phone}}='{phone}'"})
+            for r in existing:
+                airtable_delete("Meal Plan", r['id'])
+
+            saved = 0
+            for entry in meal_entries:
+                try:
+                    airtable_post("Meal Plan", {
+                        "Phone": phone,
+                        "Week Of": week_of,
+                        "Day": str(entry.get('day', '')),
+                        "Meal Type": str(entry.get('meal_type', '')),
+                        "Meal Name": str(entry.get('meal_name', '')),
+                        "Foods": str(entry.get('foods', '')),
+                        "Estimated Calories": int(entry.get('calories', 0)),
+                        "Estimated Protein": int(entry.get('protein', 0)),
+                        "Estimated Carbs": int(entry.get('carbs', 0)),
+                        "Estimated Fat": int(entry.get('fat', 0)),
+                    })
+                    saved += 1
+                except Exception as e:
+                    app.logger.warning(f"Meal plan entry save error: {e}")
+
+            app.logger.info(f"generate_meal_plan: saved {saved} entries for {phone}")
+        except Exception as e:
+            app.logger.error(f"generate_meal_plan async error: {e}", exc_info=True)
+
+    threading.Thread(target=_generate, daemon=True).start()
+    return ("I'm generating your personalized meal plan right now — this takes about 15 seconds. "
+            "Say 'read my meal plan' in a moment to hear it, or 'create my shopping list' once it's ready.")
+
+# ── NEW: Get Meal Plan ────────────────────────────────────────────────────────
+
+def handle_get_meal_plan(phone, args):
+    """Read back the user's meal plan by day."""
+    try:
+        day_filter = str(args.get('day', '')).strip()  # e.g., "Monday" or "today" or "" for all
+
+        # Resolve "today" to actual day name
+        if day_filter.lower() in ('today', 'now'):
+            day_filter = datetime.now(timezone.utc).strftime('%A')
+
+        if day_filter:
+            formula = f"AND({{Phone}}='{phone}', {{Day}}='{day_filter}')"
+        else:
+            formula = f"{{Phone}}='{phone}'"
+
+        records = airtable_get("Meal Plan", {"filterByFormula": formula, "maxRecords": 28})
+
+        if not records:
+            return "You don't have a meal plan yet. Say 'create my meal plan' and I'll build one for you."
+
+        # Group by day
+        day_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+        meal_order = ['Breakfast', 'Lunch', 'Dinner', 'Snack']
+        by_day = {}
+        for r in records:
+            f = r.get('fields', {})
+            d = f.get('Day', 'Unknown')
+            if d not in by_day:
+                by_day[d] = []
+            by_day[d].append(f)
+
+        if day_filter and day_filter in by_day:
+            # Single day
+            meals = sorted(by_day[day_filter], key=lambda x: meal_order.index(x.get('Meal Type', 'Snack')) if x.get('Meal Type') in meal_order else 99)
+            lines = [f"{day_filter}:"]
+            for m in meals:
+                lines.append(f"{m.get('Meal Type', '')}: {m.get('Meal Name', '')} — {m.get('Estimated Calories', 0)} cal")
+            return " ".join(lines)
+        else:
+            # Summary of all days
+            lines = []
+            for day in day_order:
+                if day in by_day:
+                    total_cal = sum(int(m.get('Estimated Calories', 0) or 0) for m in by_day[day])
+                    lines.append(f"{day}: {total_cal} cal")
+            return "Your 7-day meal plan: " + ", ".join(lines) + ". Say a specific day to hear the full menu."
+    except Exception as e:
+        app.logger.error(f"handle_get_meal_plan error: {e}", exc_info=True)
+        return "I couldn't retrieve your meal plan right now."
+
+# ── NEW: Shopping List Generator ─────────────────────────────────────────────
+
+def handle_generate_shopping_list(phone, args):
+    """Generate a grocery shopping list from the meal plan using AI (async)."""
+    def _generate():
+        try:
+            records = airtable_get("Meal Plan", {"filterByFormula": f"{{Phone}}='{phone}'", "maxRecords": 28})
+            if not records:
+                app.logger.warning(f"generate_shopping_list: no meal plan for {phone}")
+                return
+
+            meals_text = []
+            for r in records:
+                f = r.get('fields', {})
+                meals_text.append(f"{f.get('Day','')} {f.get('Meal Type','')}: {f.get('Foods','')}")
+            meal_plan_str = "\n".join(meals_text)
+
+            system_prompt = """You are a professional nutritionist creating a grocery shopping list.
+Output ONLY a JSON array. Each item has: item_name (string), category (Produce/Protein/Dairy/Grains/Frozen/Pantry/Beverages/Other),
+quantity (string like "2 lbs" or "1 dozen"), calories_per_serving (integer), protein_per_serving (integer grams),
+carbs_per_serving (integer grams), fat_per_serving (integer grams).
+Consolidate duplicate ingredients. Use common grocery store names."""
+
+            user_prompt = f"""Create a consolidated grocery shopping list for this 7-day meal plan:
+
+{meal_plan_str}
+
+Consolidate all ingredients, remove duplicates, and organize by grocery store category.
+Output ONLY valid JSON array, no markdown, no explanation."""
+
+            ai_response = call_openai(system_prompt, user_prompt, max_tokens=2000)
+            if not ai_response:
+                app.logger.error(f"generate_shopping_list: no AI response for {phone}")
+                return
+
+            clean = re.sub(r'```(?:json)?', '', ai_response).strip()
+            items = json.loads(clean)
+
+            # Clear existing shopping list
+            existing = airtable_get("Shopping List", {"filterByFormula": f"{{Phone}}='{phone}'"})
+            for r in existing:
+                airtable_delete("Shopping List", r['id'])
+
+            session_date = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+            saved = 0
+            for item in items:
+                try:
+                    airtable_post("Shopping List", {
+                        "Phone": phone,
+                        "Session Date": session_date,
+                        "Item Name": str(item.get('item_name', '')),
+                        "Category": str(item.get('category', 'Other')),
+                        "Quantity": str(item.get('quantity', '')),
+                        "Calories Per Serving": int(item.get('calories_per_serving', 0)),
+                        "Protein Per Serving": int(item.get('protein_per_serving', 0)),
+                        "Carbs Per Serving": int(item.get('carbs_per_serving', 0)),
+                        "Fat Per Serving": int(item.get('fat_per_serving', 0)),
+                        "In Cart": False
+                    })
+                    saved += 1
+                except Exception as e:
+                    app.logger.warning(f"Shopping list item save error: {e}")
+
+            app.logger.info(f"generate_shopping_list: saved {saved} items for {phone}")
+        except Exception as e:
+            app.logger.error(f"generate_shopping_list async error: {e}", exc_info=True)
+
+    threading.Thread(target=_generate, daemon=True).start()
+    return ("I'm building your shopping list right now — give me about 15 seconds. "
+            "Say 'read my shopping list' in a moment and I'll guide you through it.")
+
+# ── NEW: Get Shopping List ────────────────────────────────────────────────────
+
+def handle_get_shopping_list(phone, args):
+    """Read the shopping list, optionally filtered by category."""
+    try:
+        category_filter = str(args.get('category', '')).strip()
+        show_unchecked_only = args.get('unchecked_only', True)
+
+        if category_filter:
+            formula = f"AND({{Phone}}='{phone}', {{Category}}='{category_filter}')"
+        elif show_unchecked_only:
+            formula = f"AND({{Phone}}='{phone}', NOT({{In Cart}}))"
+        else:
+            formula = f"{{Phone}}='{phone}'"
+
+        records = airtable_get("Shopping List", {"filterByFormula": formula, "maxRecords": 100})
+
+        if not records:
+            if show_unchecked_only:
+                return "Everything on your shopping list is already in your cart! You're all set."
+            return "Your shopping list is empty. Say 'create my shopping list' to generate one from your meal plan."
+
+        # Group by category
+        by_cat = {}
+        for r in records:
+            f = r.get('fields', {})
+            cat = f.get('Category', 'Other')
+            if cat not in by_cat:
+                by_cat[cat] = []
+            by_cat[cat].append(f.get('Item Name', '') + (f" — {f.get('Quantity','')}" if f.get('Quantity') else ''))
+
+        cat_order = ['Produce', 'Protein', 'Dairy', 'Grains', 'Frozen', 'Pantry', 'Beverages', 'Other']
+        lines = []
+        for cat in cat_order:
+            if cat in by_cat:
+                lines.append(f"{cat}: {', '.join(by_cat[cat])}")
+
+        remaining = len(records)
+        return f"You have {remaining} items left. " + ". ".join(lines) + "."
+    except Exception as e:
+        app.logger.error(f"handle_get_shopping_list error: {e}", exc_info=True)
+        return "I couldn't retrieve your shopping list right now."
+
+# ── NEW: Check Off Shopping Item ─────────────────────────────────────────────
+
+def handle_check_off_item(phone, args):
+    """Mark a shopping list item as in-cart."""
+    try:
+        item_name = str(args.get('item_name', '')).strip()
+        if not item_name:
+            return "Which item did you grab?"
+
+        formula = (
+            f"AND({{Phone}}='{phone}', "
+            f"FIND(LOWER('{item_name.lower()}'), LOWER({{Item Name}})) > 0, "
+            f"NOT({{In Cart}}))"
+        )
+        records = airtable_get("Shopping List", {"filterByFormula": formula, "maxRecords": 1})
+
+        if not records:
+            return f"I don't see {item_name} on your list, or it's already checked off."
+
+        record_id = records[0]['id']
+        actual_name = records[0].get('fields', {}).get('Item Name', item_name)
+        airtable_patch("Shopping List", record_id, {"In Cart": True})
+
+        # Count remaining
+        remaining_records = airtable_get("Shopping List", {
+            "filterByFormula": f"AND({{Phone}}='{phone}', NOT({{In Cart}}))",
+            "maxRecords": 100
+        })
+        remaining = len(remaining_records)
+
+        if remaining == 0:
+            return f"Got it, {actual_name} is in your cart. That's everything on your list — you're done shopping!"
+        return f"Got it, {actual_name} is in your cart. {remaining} items left."
+    except Exception as e:
+        app.logger.error(f"handle_check_off_item error: {e}", exc_info=True)
+        return "Checked off."
+
+# ── NEW: Log Cart Item to Food Diary ─────────────────────────────────────────
+
+def handle_log_cart_item(phone, call_id, args):
+    """Log a grocery item selected at the store directly to the food diary."""
+    try:
+        item_name = str(args.get('item_name', '')).strip()
+        quantity  = str(args.get('quantity', '1 serving')).strip()
+        meal_type = str(args.get('meal_type', '')).strip()
+
+        # Look up nutrition from shopping list
+        formula = (
+            f"AND({{Phone}}='{phone}', "
+            f"FIND(LOWER('{item_name.lower()}'), LOWER({{Item Name}})) > 0)"
+        )
+        records = airtable_get("Shopping List", {"filterByFormula": formula, "maxRecords": 1})
+
+        calories = 0
+        protein  = 0
+        carbs    = 0
+        fat      = 0
+
+        if records:
+            f = records[0].get('fields', {})
+            calories = int(f.get('Calories Per Serving', 0) or 0)
+            protein  = int(f.get('Protein Per Serving', 0) or 0)
+            carbs    = int(f.get('Carbs Per Serving', 0) or 0)
+            fat      = int(f.get('Fat Per Serving', 0) or 0)
+
+        # Log to food diary
+        log_args = {
+            'food_name': item_name,
+            'calories': calories,
+            'protein': protein,
+            'carbs': carbs,
+            'fat': fat
+        }
+        handle_log_food(phone, call_id, log_args)
+
+        # Also mark as in-cart on shopping list
+        if records:
+            airtable_patch("Shopping List", records[0]['id'], {"In Cart": True})
+
+        cal_text = f" at {calories} calories" if calories else ""
+        return f"Logged {item_name}{cal_text} to your food diary."
+    except Exception as e:
+        app.logger.error(f"handle_log_cart_item error: {e}", exc_info=True)
+        return "Logged."
+
+# ── NEW: Get Goals ────────────────────────────────────────────────────────────
+
+def handle_get_goals(phone, args):
+    """Read back the user's current nutrition goals."""
+    try:
+        contact_fields, _ = get_user_profile_fields(phone)
+        calorie_goal = contact_fields.get('Calorie Goal')
+        protein_goal = contact_fields.get('Protein Goal')
+        carb_goal    = contact_fields.get('Carb Goal')
+        fat_goal     = contact_fields.get('Fat Goal')
+        goal_type    = contact_fields.get('Goal', '')
+
+        if not calorie_goal:
+            return "You haven't set a goal yet. Say 'set my goal' and I'll walk you through it."
+
+        goal_labels = {
+            'lose_weight': 'lose weight',
+            'gain_muscle': 'build muscle',
+            'maintain': 'maintain your weight'
+        }
+        goal_label = goal_labels.get(goal_type, goal_type or 'reach your goal')
+
+        return (f"Your goal is to {goal_label}. "
+                f"Daily targets: {int(calorie_goal)} calories, "
+                f"{int(protein_goal or 0)}g protein, "
+                f"{int(carb_goal or 0)}g carbs, "
+                f"{int(fat_goal or 0)}g fat.")
+    except Exception as e:
+        app.logger.error(f"handle_get_goals error: {e}", exc_info=True)
+        return "I couldn't retrieve your goals right now."
+
 # ── Tool dispatch ─────────────────────────────────────────────────────────────
 
+def handle_send_shopping_list_email(phone, args):
+    """Email the user their grocery shopping list."""
+    def send_async():
+        try:
+            from sendgrid import SendGridAPIClient
+            from sendgrid.helpers.mail import Mail
+
+            SENDGRID_KEY = os.environ.get('SENDGRID_API_KEY', '')
+            FROM_EMAIL   = os.environ.get('FROM_EMAIL', 'hello@voicetrim.com')
+            if not SENDGRID_KEY:
+                app.logger.error('SENDGRID_API_KEY not set')
+                return
+
+            # Get user email
+            params = {'filterByFormula': f"{{Phone}}='{phone}'", 'maxRecords': 1}
+            records = airtable_get('Users', params)
+            if not records:
+                return
+            user = records[0].get('fields', {})
+            email = user.get('Email', '')
+            name  = user.get('First Name', 'there')
+            if not email:
+                return
+
+            # Get shopping list
+            sl_records = airtable_get('Shopping List', {
+                'filterByFormula': f"{{Phone}}='{phone}'",
+                'maxRecords': 200
+            })
+
+            if not sl_records:
+                return
+
+            # Group by category
+            cat_order = ['Produce', 'Protein', 'Dairy', 'Grains', 'Frozen', 'Pantry', 'Beverages', 'Other']
+            by_cat = {}
+            for r in sl_records:
+                f = r.get('fields', {})
+                cat = f.get('Category', 'Other')
+                if cat not in by_cat:
+                    by_cat[cat] = []
+                item = f.get('Item Name', '')
+                qty  = f.get('Quantity', '')
+                checked = f.get('In Cart', False)
+                status = '✓' if checked else '○'
+                by_cat[cat].append(f"{status} {item}" + (f" ({qty})" if qty else ''))
+
+            # Build HTML email
+            html_rows = ''
+            for cat in cat_order:
+                if cat in by_cat:
+                    items_html = ''.join(f'<li style="margin:4px 0;">{i}</li>' for i in by_cat[cat])
+                    html_rows += f'''
+                    <tr>
+                      <td style="padding:12px 16px; vertical-align:top;">
+                        <strong style="color:#2d6a4f;font-size:15px;">{cat}</strong>
+                        <ul style="margin:6px 0 0 0;padding-left:18px;color:#333;font-size:14px;">{items_html}</ul>
+                      </td>
+                    </tr>'''
+
+            total = len(sl_records)
+            html_body = f'''
+            <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;">
+              <div style="background:#2d6a4f;padding:24px;border-radius:8px 8px 0 0;">
+                <h1 style="color:#fff;margin:0;font-size:24px;">VoiceTrim Shopping List</h1>
+                <p style="color:#b7e4c7;margin:4px 0 0 0;">Hey {name}, here are your {total} items!</p>
+              </div>
+              <table style="width:100%;border-collapse:collapse;background:#fff;">
+                {html_rows}
+              </table>
+              <div style="background:#f0f4f0;padding:16px;border-radius:0 0 8px 8px;text-align:center;">
+                <p style="color:#666;font-size:12px;margin:0;">Generated by VoiceTrim &bull; Call +1 (971) 432-1012 to update your list</p>
+              </div>
+            </div>'''
+
+            message = Mail(
+                from_email=FROM_EMAIL,
+                to_emails=email,
+                subject=f'Your VoiceTrim Shopping List ({total} items)',
+                html_content=html_body
+            )
+            sg = SendGridAPIClient(SENDGRID_KEY)
+            sg.send(message)
+            app.logger.info(f'Shopping list email sent to {email}')
+        except Exception as e:
+            app.logger.error(f'send_shopping_list_email error: {e}', exc_info=True)
+
+    threading.Thread(target=send_async, daemon=True).start()
+    return "I'm sending your shopping list to your email right now. Check your inbox in a moment!"
+
+
+def handle_send_meal_plan_email(phone, args):
+    """Email the user their 7-day meal plan."""
+    def send_async():
+        try:
+            from sendgrid import SendGridAPIClient
+            from sendgrid.helpers.mail import Mail
+
+            SENDGRID_KEY = os.environ.get('SENDGRID_API_KEY', '')
+            FROM_EMAIL   = os.environ.get('FROM_EMAIL', 'hello@voicetrim.com')
+            if not SENDGRID_KEY:
+                app.logger.error('SENDGRID_API_KEY not set')
+                return
+
+            # Get user email
+            params = {'filterByFormula': f"{{Phone}}='{phone}'", 'maxRecords': 1}
+            records = airtable_get('Users', params)
+            if not records:
+                return
+            user = records[0].get('fields', {})
+            email = user.get('Email', '')
+            name  = user.get('First Name', 'there')
+            if not email:
+                return
+
+            # Get meal plan
+            mp_records = airtable_get('Meal Plan', {
+                'filterByFormula': f"{{Phone}}='{phone}'",
+                'maxRecords': 28
+            })
+
+            if not mp_records:
+                return
+
+            # Group by day
+            day_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+            meal_order = ['Breakfast', 'Lunch', 'Dinner', 'Snack']
+            by_day = {}
+            for r in mp_records:
+                f = r.get('fields', {})
+                d = f.get('Day', 'Unknown')
+                if d not in by_day:
+                    by_day[d] = []
+                by_day[d].append(f)
+
+            # Build HTML rows
+            html_rows = ''
+            for day in day_order:
+                if day not in by_day:
+                    continue
+                meals = sorted(by_day[day], key=lambda x: meal_order.index(x.get('Meal Type','Snack')) if x.get('Meal Type') in meal_order else 99)
+                meals_html = ''.join(
+                    f'<tr><td style="padding:4px 8px;color:#555;font-size:13px;">{m.get("Meal Type","")}</td>'
+                    f'<td style="padding:4px 8px;font-size:13px;">{m.get("Meal Name","")}</td>'
+                    f'<td style="padding:4px 8px;color:#888;font-size:13px;text-align:right;">{m.get("Estimated Calories",0)} cal</td></tr>'
+                    for m in meals
+                )
+                day_total = sum(m.get('Estimated Calories', 0) for m in meals)
+                html_rows += f'''
+                <tr style="background:#f0f4f0;">
+                  <td colspan="3" style="padding:10px 16px;font-weight:bold;color:#2d6a4f;font-size:15px;">{day} &mdash; {day_total} cal total</td>
+                </tr>
+                {meals_html}'''
+
+            html_body = f'''
+            <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;">
+              <div style="background:#2d6a4f;padding:24px;border-radius:8px 8px 0 0;">
+                <h1 style="color:#fff;margin:0;font-size:24px;">VoiceTrim 7-Day Meal Plan</h1>
+                <p style="color:#b7e4c7;margin:4px 0 0 0;">Hey {name}, here is your personalized meal plan!</p>
+              </div>
+              <table style="width:100%;border-collapse:collapse;background:#fff;">
+                {html_rows}
+              </table>
+              <div style="background:#f0f4f0;padding:16px;border-radius:0 0 8px 8px;text-align:center;">
+                <p style="color:#666;font-size:12px;margin:0;">Generated by VoiceTrim &bull; Call +1 (971) 432-1012 to update your plan</p>
+              </div>
+            </div>'''
+
+            message = Mail(
+                from_email=FROM_EMAIL,
+                to_emails=email,
+                subject='Your VoiceTrim 7-Day Meal Plan',
+                html_content=html_body
+            )
+            sg = SendGridAPIClient(SENDGRID_KEY)
+            sg.send(message)
+            app.logger.info(f'Meal plan email sent to {email}')
+        except Exception as e:
+            app.logger.error(f'send_meal_plan_email error: {e}', exc_info=True)
+
+    threading.Thread(target=send_async, daemon=True).start()
+    return "I'm sending your meal plan to your email right now. Check your inbox in a moment!"
+
+
 TOOL_HANDLERS = {
-    'log_food':           lambda phone, call_id, args: handle_log_food(phone, call_id, args),
-    'delete_food':        lambda phone, call_id, args: handle_delete_food(phone, args),
-    'get_totals':         lambda phone, call_id, args: handle_get_totals(phone, args),
-    'save_profile':       lambda phone, call_id, args: handle_save_profile(phone, args),
-    'save_usual':         lambda phone, call_id, args: handle_save_usual(phone, args),
-    'log_usual':          lambda phone, call_id, args: handle_log_usual(phone, call_id, args),
-    'log_shopping_item':  lambda phone, call_id, args: handle_log_shopping_item(phone, args),
-    'save_meal_plan':     lambda phone, call_id, args: handle_save_meal_plan(phone, args),
-    'send_summary_email': lambda phone, call_id, args: handle_send_summary_email(phone, args),
-    'get_user_profile':   lambda phone, call_id, args: handle_get_user_profile(phone, args),
+    'log_food':                lambda phone, call_id, args: handle_log_food(phone, call_id, args),
+    'delete_food':             lambda phone, call_id, args: handle_delete_food(phone, args),
+    'get_totals':              lambda phone, call_id, args: handle_get_totals(phone, args),
+    'save_profile':            lambda phone, call_id, args: handle_save_profile(phone, args),
+    'save_usual':              lambda phone, call_id, args: handle_save_usual(phone, args),
+    'log_usual':               lambda phone, call_id, args: handle_log_usual(phone, call_id, args),
+    'log_shopping_item':       lambda phone, call_id, args: handle_log_shopping_item(phone, args),
+    'save_meal_plan':          lambda phone, call_id, args: handle_save_meal_plan(phone, args),
+    'send_summary_email':      lambda phone, call_id, args: handle_send_summary_email(phone, args),
+    'get_user_profile':        lambda phone, call_id, args: handle_get_user_profile(phone, args),
+    # NEW tools
+    'set_goal':                lambda phone, call_id, args: handle_set_goal(phone, args),
+    'generate_meal_plan':      lambda phone, call_id, args: handle_generate_meal_plan(phone, args),
+    'get_meal_plan':           lambda phone, call_id, args: handle_get_meal_plan(phone, args),
+    'generate_shopping_list':  lambda phone, call_id, args: handle_generate_shopping_list(phone, args),
+    'get_shopping_list':       lambda phone, call_id, args: handle_get_shopping_list(phone, args),
+    'check_off_item':          lambda phone, call_id, args: handle_check_off_item(phone, args),
+    'log_cart_item':           lambda phone, call_id, args: handle_log_cart_item(phone, call_id, args),
+    'get_goals':               lambda phone, call_id, args: handle_get_goals(phone, args),
+    'send_shopping_list_email': lambda phone, call_id, args: handle_send_shopping_list_email(phone, args),
+    'send_meal_plan_email':     lambda phone, call_id, args: handle_send_meal_plan_email(phone, args),
 }
 
 @app.route('/tool/<tool_name>', methods=['POST'])
@@ -582,13 +1265,41 @@ def handle_tool(tool_name):
         app.logger.error(f"Route error: {e}", exc_info=True)
         return jsonify({"results": [{"toolCallId": "error", "result": "logged"}]}), 200
 
+def check_subscription(phone):
+    """Check if a phone number has an active VoiceTrim subscription.
+    Returns True if active or trialing, False otherwise.
+    Falls back to True (allow call) if the check endpoint is unreachable,
+    so a server outage never blocks existing subscribers.
+    """
+    if PAYWALL_BYPASS:
+        app.logger.info(f"Paywall bypassed for {phone} (PAYWALL_BYPASS=true)")
+        return True
+    if not VOICE_GATEWAY_API_KEY:
+        app.logger.warning("VOICE_GATEWAY_API_KEY not set — paywall disabled")
+        return True
+    try:
+        import urllib.parse
+        params = urllib.parse.urlencode({
+            'input': json.dumps({'json': {'phone': phone, 'apiKey': VOICE_GATEWAY_API_KEY}})
+        })
+        url = f"{LANDING_PAGE_URL}/api/trpc/subscription.checkByPhone?{params}"
+        resp = requests.get(url, timeout=4)
+        if resp.status_code == 200:
+            data = resp.json()
+            active = data.get('result', {}).get('data', {}).get('json', {}).get('active', False)
+            app.logger.info(f"Subscription check for {phone}: active={active}")
+            return bool(active)
+        else:
+            app.logger.warning(f"Subscription check returned {resp.status_code} — allowing call (fail-open)")
+            return True
+    except Exception as e:
+        app.logger.warning(f"Subscription check error for {phone}: {e} — allowing call (fail-open)")
+        return True
+
+
 @app.route('/incoming-call', methods=['POST'])
 def incoming_call():
-    """Vapi assistant-request handler.
-    Phone number has NO assistantId — Vapi sends assistant-request here.
-    We respond with assistantId + assistantOverrides containing a personalized firstMessage.
-    Uses in-memory cache for sub-100ms response time.
-    """
+    """Vapi assistant-request handler — personalized greeting per caller."""
     ASSISTANT_ID = os.environ.get('VAPI_ASSISTANT_ID', '8cc2b2a2-5bb5-4f20-814b-d4a34db8d71d')
     try:
         body = request.json or {}
@@ -596,6 +1307,22 @@ def incoming_call():
         call = msg.get('call', {})
         phone = call.get('customer', {}).get('number', '')
         app.logger.info(f"incoming-call: phone={phone}")
+
+        # ── Paywall gate ──────────────────────────────────────────────────────
+        if phone and not check_subscription(phone):
+            app.logger.info(f"incoming-call: {phone} is not subscribed — blocking call")
+            return jsonify({
+                "assistantId": ASSISTANT_ID,
+                "assistantOverrides": {
+                    "firstMessage": (
+                        "Hi there! It looks like you don't have an active VoiceTrim subscription. "
+                        "To get started, visit voicetrim-landing.manus.space and sign up for just "
+                        "$9.99 a month. We'd love to have you! Goodbye."
+                    ),
+                    "endCallAfterSpoken": True
+                }
+            })
+        # ─────────────────────────────────────────────────────────────────────
 
         first_name = 'there'
         is_new = True
@@ -635,11 +1362,11 @@ def call_start():
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({"status": "ok", "service": "VoiceTrim Middleware", "version": "2.0"})
+    return jsonify({"status": "ok", "service": "VoiceTrim Middleware", "version": "3.0"})
 
 @app.route('/', methods=['GET'])
 def index():
-    return jsonify({"service": "VoiceTrim Middleware", "status": "running", "version": "2.0"})
+    return jsonify({"service": "VoiceTrim Middleware", "status": "running", "version": "3.0"})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5556))
