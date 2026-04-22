@@ -1301,6 +1301,7 @@ def check_subscription(phone):
 def incoming_call():
     """Vapi assistant-request handler — personalized greeting per caller."""
     ASSISTANT_ID = os.environ.get('VAPI_ASSISTANT_ID', '8cc2b2a2-5bb5-4f20-814b-d4a34db8d71d')
+    ONBOARDING_ASSISTANT_ID = os.environ.get('VAPI_ONBOARDING_ASSISTANT_ID', '')
     try:
         body = request.json or {}
         msg = body.get('message', {})
@@ -1308,21 +1309,27 @@ def incoming_call():
         phone = call.get('customer', {}).get('number', '')
         app.logger.info(f"incoming-call: phone={phone}")
 
-        # ── Paywall gate ──────────────────────────────────────────────────────
+        # ── Paywall gate ────────────────────────────────────────────────────────────────
         if phone and not check_subscription(phone):
-            app.logger.info(f"incoming-call: {phone} is not subscribed — blocking call")
-            return jsonify({
-                "assistantId": ASSISTANT_ID,
-                "assistantOverrides": {
-                    "firstMessage": (
-                        "Hi there! It looks like you don't have an active VoiceTrim subscription. "
-                        "To get started, visit voicetrim-landing.manus.space and sign up for just "
-                        "$9.99 a month. We'd love to have you! Goodbye."
-                    ),
-                    "endCallAfterSpoken": True
-                }
-            })
-        # ─────────────────────────────────────────────────────────────────────
+            app.logger.info(f"incoming-call: {phone} is not subscribed — routing to onboarding")
+
+            # If an onboarding assistant is configured, route there for a proper
+            # sign-up conversation. Otherwise fall back to a simple upsell message.
+            if ONBOARDING_ASSISTANT_ID:
+                return jsonify({"assistantId": ONBOARDING_ASSISTANT_ID})
+            else:
+                return jsonify({
+                    "assistantId": ASSISTANT_ID,
+                    "assistantOverrides": {
+                        "firstMessage": (
+                            "Hi there! Welcome to VoiceTrim. It looks like you don't have an active "
+                            "subscription yet. To get started, visit voicetrim-landing.manus.space "
+                            "and sign up for just $9.99 a month. We'd love to have you! Goodbye."
+                        ),
+                        "endCallAfterSpoken": True
+                    }
+                })
+        # ───────────────────────────────────────────────────────────────────────
 
         first_name = 'there'
         is_new = True
@@ -1355,14 +1362,155 @@ def incoming_call():
             }
         })
 
+
+@app.route('/send-signup-link', methods=['POST'])
+def send_signup_link():
+    """Called by the Vapi onboarding assistant tool after collecting name + email.
+    Forwards the data to the landing page server which saves the pending signup
+    and sends the email.
+    """
+    try:
+        body = request.json or {}
+        msg = body.get('message', {})
+        call = msg.get('call', {})
+        phone = call.get('customer', {}).get('number', '')
+
+        # Extract tool call arguments
+        tool_calls = msg.get('toolCalls', msg.get('toolCallList', []))
+        if not tool_calls:
+            return jsonify({"results": [{"toolCallId": "unknown", "result": "error: no tool calls"}]})
+
+        tc = tool_calls[0]
+        tc_id = tc.get('id', 'unknown')
+        func = tc.get('function', {})
+        args = parse_args(func)
+
+        caller_name = str(args.get('caller_name', '')).strip()
+        caller_email = str(args.get('caller_email', '')).strip().lower()
+
+        if not caller_name or not caller_email or '@' not in caller_email:
+            app.logger.warning(f"send-signup-link: invalid args name='{caller_name}' email='{caller_email}'")
+            return jsonify({"results": [{"toolCallId": tc_id, "result": "error: missing name or email"}]})
+
+        app.logger.info(f"send-signup-link: phone={phone} name={caller_name} email={caller_email}")
+
+        # Call the landing page server's sendSignupLink tRPC mutation
+        import urllib.parse
+        trpc_url = f"{LANDING_PAGE_URL}/api/trpc/subscription.sendSignupLink"
+        payload = {
+            'json': {
+                'phone': phone,
+                'name': caller_name,
+                'email': caller_email,
+                'apiKey': VOICE_GATEWAY_API_KEY,
+                'origin': LANDING_PAGE_URL,
+            }
+        }
+        resp = requests.post(
+            trpc_url,
+            json={'0': payload},
+            headers={'Content-Type': 'application/json'},
+            timeout=8
+        )
+
+        if resp.status_code == 200:
+            data = resp.json()
+            email_sent = data.get('result', {}).get('data', {}).get('json', {}).get('emailSent', False)
+            if email_sent:
+                result_msg = f"Done! I've sent the signup link to {caller_email}. Check your inbox in about a minute."
+            else:
+                result_msg = f"I've saved your details. You can sign up at voicetrim-landing.manus.space when you're ready."
+        else:
+            app.logger.warning(f"send-signup-link: landing page returned {resp.status_code}")
+            result_msg = f"I've noted your details. Visit voicetrim-landing.manus.space to complete your signup."
+
+        return jsonify({"results": [{"toolCallId": tc_id, "result": result_msg}]})
+
+    except Exception as e:
+        app.logger.error(f"send-signup-link error: {e}", exc_info=True)
+        return jsonify({"results": [{"toolCallId": "error", "result": "done"}]}), 200
+
 @app.route('/call-start', methods=['POST'])
 def call_start():
     """Legacy endpoint — kept for backwards compatibility."""
     return incoming_call()
 
+@app.route('/call-completed', methods=['POST'])
+def call_completed():
+    """
+    Called by Vapi's end-of-call webhook when a call ends.
+    Records the call in the landing page DB, updates the subscriber's streak,
+    and returns streak milestone data so the next call can celebrate it.
+    
+    Expected Vapi payload:
+    {
+      "message": {
+        "type": "end-of-call-report",
+        "call": { "id": "...", "customer": { "number": "+1..." } },
+        "durationSeconds": 120,
+        "summary": "User logged chicken salad..."
+      }
+    }
+    """
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+        message = body.get('message', body)  # Vapi wraps in message key
+        call = message.get('call', {})
+        phone = call.get('customer', {}).get('number', '')
+        vapi_call_id = call.get('id', '')
+        duration_seconds = int(message.get('durationSeconds', 0))
+        summary = message.get('summary', '')
+
+        if not phone:
+            app.logger.warning('[call-completed] No phone number in payload')
+            return jsonify({'success': False, 'error': 'no phone number'}), 400
+
+        if not VOICE_GATEWAY_API_KEY:
+            app.logger.warning('[call-completed] VOICE_GATEWAY_API_KEY not set, skipping record')
+            return jsonify({'success': True, 'skipped': True})
+
+        # Call the landing page server to record the call and update streak
+        payload = {
+            'json': {
+                'phone': phone,
+                'apiKey': VOICE_GATEWAY_API_KEY,
+                'vapiCallId': vapi_call_id,
+                'durationSeconds': duration_seconds,
+                'summary': summary or None,
+            }
+        }
+        resp = requests.post(
+            f'{LANDING_PAGE_URL}/api/trpc/subscription.recordCall',
+            json=payload,
+            timeout=10
+        )
+        result = resp.json().get('result', {}).get('data', {}).get('json', {})
+        is_first_call = result.get('isFirstCall', False)
+        current_streak = result.get('currentStreak', 0)
+
+        app.logger.info(
+            f'[call-completed] phone={phone} duration={duration_seconds}s '
+            f'isFirstCall={is_first_call} streak={current_streak}'
+        )
+
+        # Log streak milestones for visibility
+        if current_streak in (3, 7, 14, 30, 60, 90, 100):
+            app.logger.info(f'[streak-milestone] {phone} reached {current_streak}-day streak!')
+
+        return jsonify({
+            'success': True,
+            'isFirstCall': is_first_call,
+            'currentStreak': current_streak,
+        })
+
+    except Exception as e:
+        app.logger.error(f'[call-completed] Error: {e}')
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({"status": "ok", "service": "VoiceTrim Middleware", "version": "3.0"})
+    return jsonify({"status": "ok", "service": "VoiceTrim Middleware", "version": "3.1"})
 
 @app.route('/', methods=['GET'])
 def index():

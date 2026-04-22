@@ -1,3 +1,5 @@
 flask==3.0.3
 requests==2.31.0
 gunicorn==21.2.0
+sendgrid==6.11.0
+openai>=1.52.0

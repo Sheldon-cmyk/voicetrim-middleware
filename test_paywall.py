@@ -214,3 +214,143 @@ class TestIncomingCallPaywall:
         overrides = data.get('assistantOverrides', {})
         assert 'Alex' in overrides.get('firstMessage', '')
         assert overrides.get('endCallAfterSpoken') is not True
+
+
+# ── Onboarding routing tests ───────────────────────────────────────────────────
+
+class TestOnboardingRouting:
+    """Tests for non-subscriber routing to onboarding assistant."""
+
+    def test_non_subscriber_routes_to_onboarding_assistant(self, client):
+        """Non-subscribers with onboarding assistant ID configured get routed there."""
+        os.environ['VAPI_ONBOARDING_ASSISTANT_ID'] = 'onboarding-asst-123'
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            'result': {'data': {'json': {'active': False, 'status': None}}}
+        }
+        with patch('requests.get', return_value=mock_response):
+            with patch('app.get_user_fast', return_value=None):
+                resp = client.post(
+                    '/incoming-call',
+                    json=make_incoming_call_body('+15559990001'),
+                    content_type='application/json'
+                )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data['assistantId'] == 'onboarding-asst-123'
+        # No assistantOverrides — the onboarding assistant handles everything
+        assert 'assistantOverrides' not in data
+
+    def test_non_subscriber_fallback_when_no_onboarding_assistant(self, client):
+        """Non-subscribers get upsell message when no onboarding assistant is configured."""
+        os.environ['VAPI_ONBOARDING_ASSISTANT_ID'] = ''
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            'result': {'data': {'json': {'active': False, 'status': None}}}
+        }
+        with patch('requests.get', return_value=mock_response):
+            with patch('app.get_user_fast', return_value=None):
+                resp = client.post(
+                    '/incoming-call',
+                    json=make_incoming_call_body('+15559990002'),
+                    content_type='application/json'
+                )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        overrides = data.get('assistantOverrides', {})
+        assert overrides.get('endCallAfterSpoken') is True
+        assert 'voicetrim-landing.manus.space' in overrides.get('firstMessage', '')
+
+
+# ── /send-signup-link endpoint tests ─────────────────────────────────────────
+
+def make_tool_call_body(phone, name, email):
+    """Build a Vapi tool-call request body for send_signup_link."""
+    return {
+        'message': {
+            'call': {'customer': {'number': phone}, 'id': 'call_test_456'},
+            'toolCalls': [{
+                'id': 'tc_test_001',
+                'function': {
+                    'name': 'send_signup_link',
+                    'arguments': json.dumps({'caller_name': name, 'caller_email': email})
+                }
+            }]
+        }
+    }
+
+
+class TestSendSignupLink:
+    """Tests for the /send-signup-link endpoint."""
+
+    def test_send_signup_link_success(self, client):
+        """Valid name + email triggers landing page API call and returns success message."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            'result': {'data': {'json': {'success': True, 'emailSent': True}}}
+        }
+        with patch('requests.post', return_value=mock_resp):
+            resp = client.post(
+                '/send-signup-link',
+                json=make_tool_call_body('+15551234567', 'John Doe', 'john@example.com'),
+                content_type='application/json'
+            )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        results = data.get('results', [])
+        assert len(results) == 1
+        assert results[0]['toolCallId'] == 'tc_test_001'
+        assert 'john@example.com' in results[0]['result']
+
+    def test_send_signup_link_missing_email(self, client):
+        """Missing email returns an error result."""
+        resp = client.post(
+            '/send-signup-link',
+            json=make_tool_call_body('+15551234567', 'John Doe', ''),
+            content_type='application/json'
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert 'error' in data['results'][0]['result'].lower()
+
+    def test_send_signup_link_invalid_email(self, client):
+        """Invalid email (no @) returns an error result."""
+        resp = client.post(
+            '/send-signup-link',
+            json=make_tool_call_body('+15551234567', 'John Doe', 'notanemail'),
+            content_type='application/json'
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert 'error' in data['results'][0]['result'].lower()
+
+    def test_send_signup_link_landing_page_down(self, client):
+        """When landing page is unreachable, returns a graceful fallback message."""
+        with patch('requests.post', side_effect=Exception('Connection refused')):
+            resp = client.post(
+                '/send-signup-link',
+                json=make_tool_call_body('+15551234567', 'Jane Smith', 'jane@example.com'),
+                content_type='application/json'
+            )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        # Should not crash — returns a graceful fallback
+        assert len(data.get('results', [])) == 1
+
+    def test_send_signup_link_no_tool_calls(self, client):
+        """Empty tool calls list returns an error result."""
+        resp = client.post(
+            '/send-signup-link',
+            json={'message': {'call': {'customer': {'number': '+15551234567'}}, 'toolCalls': []}},
+            content_type='application/json'
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert 'error' in data['results'][0]['result'].lower()
+
+
+if __name__ == '__main__':
+    pytest.main([__file__, '-v'])
